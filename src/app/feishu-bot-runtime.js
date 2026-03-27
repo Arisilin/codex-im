@@ -3,7 +3,6 @@ const { SessionStore } = require("../infra/storage/session-store");
 const { CodexRpcClient } = require("../infra/codex/rpc-client");
 const {
   buildExternalInputCard,
-  buildExternalSummaryCard,
   buildCardResponse,
   buildCardToast,
   buildEffortInfoText,
@@ -284,7 +283,6 @@ function attachRuntimeForwarders() {
 
   const plainForwarders = {
     buildExternalInputCard,
-    buildExternalSummaryCard,
     buildCardResponse,
     buildCardToast,
     buildEffortInfoText,

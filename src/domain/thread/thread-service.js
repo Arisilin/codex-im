@@ -17,8 +17,6 @@ const THREAD_SOURCE_KINDS = new Set([
   "unknown",
 ]);
 
-const SLURM_WAKEUP_THREAD_NOTE_PREFIX = "[codex-im system note]";
-
 async function resolveWorkspaceThreadState(runtime, {
   bindingKey,
   workspaceRoot,
@@ -169,10 +167,7 @@ async function ensureThreadAndSendMessage(runtime, {
       deliveryMode,
     });
     try {
-      const outgoingText = buildOutgoingUserText(runtime, {
-        threadId,
-        normalized,
-      });
+      const outgoingText = buildOutgoingUserText(normalized);
       await runtime.codex.sendUserMessage({
         threadId,
         text: outgoingText,
@@ -245,33 +240,8 @@ function resolveTurnDeliveryMode(normalized) {
   return normalized?.provider === "feishu" ? "live" : "session";
 }
 
-function buildOutgoingUserText(runtime, { threadId, normalized }) {
-  const text = typeof normalized?.text === "string" ? normalized.text : "";
-  const normalizedThreadId = typeof threadId === "string" ? threadId.trim() : "";
-  if (!text || !normalizedThreadId) {
-    return text;
-  }
-
-  if (typeof runtime.isReviewerThreadId === "function" && runtime.isReviewerThreadId(normalizedThreadId)) {
-    return text;
-  }
-
-  const threadNote = buildSlurmWakeupThreadNote(normalizedThreadId);
-  if (text.includes(threadNote) || text.includes(SLURM_WAKEUP_THREAD_NOTE_PREFIX)) {
-    return text;
-  }
-
-  return `${text}\n\n${threadNote}`;
-}
-
-function buildSlurmWakeupThreadNote(threadId) {
-  return [
-    SLURM_WAKEUP_THREAD_NOTE_PREFIX,
-    `Current main thread id for this conversation: ${threadId}`,
-    "If this turn uses slurm-codex-wakeup or runs slurm_resume.py submit, you must pass:",
-    `--session-id ${threadId}`,
-    "Use that literal UUID. Do not use $CODEX_THREAD_ID or $CODEX_SESSION_ID.",
-  ].join("\n");
+function buildOutgoingUserText(normalized) {
+  return typeof normalized?.text === "string" ? normalized.text : "";
 }
 
 async function createWorkspaceThread(runtime, { bindingKey, workspaceRoot, normalized }) {
@@ -370,7 +340,6 @@ async function handleNewCommand(runtime, normalized) {
       replyToMessageId: normalized.messageId,
       text: `已创建新线程并切换到它:\n${workspaceRoot}\n\nthread: ${createdThreadId}`,
     });
-    await runtime.showStatusPanel(normalized, { replyToMessageId: normalized.messageId });
   } catch (error) {
     await runtime.sendInfoCardMessage({
       chatId: normalized.chatId,

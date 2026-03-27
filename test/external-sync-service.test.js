@@ -3,6 +3,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const { upsertAssistantReplyCard } = require("../src/presentation/card/card-service");
 
 const {
   classifyExternalInputText,
@@ -10,7 +11,7 @@ const {
   hasDeliveredAssistantTurn,
   maybeHandleExternalTurnCompletedReview,
   parseMainThreadSessionChunk,
-  stripCodexImSystemNote,
+  parseMainThreadSessionChunkState,
   shouldSkipLiveSessionSync,
   shouldSkipTrackedBindingRead,
   syncExternalSessions,
@@ -36,7 +37,6 @@ function createSyncRuntime({
   const sessionSyncStateByWorkspace = new Map([
     [workspaceRoot, sessionSyncState ? { ...sessionSyncState } : null],
   ]);
-  const summaryCardStateByWorkspace = new Map();
   const replyDetailByMessageId = new Map();
   const assistantCardCalls = [];
   let sentMessageCounter = 0;
@@ -62,26 +62,21 @@ function createSyncRuntime({
       listTrackedWorkspaceThreads: () => [{
         ...trackedBinding,
         sessionSyncState: sessionSyncStateByWorkspace.get(workspaceRoot),
-        summaryCardState: summaryCardStateByWorkspace.get(workspaceRoot) || null,
       }],
       getDeliveryContextForWorkspace: () => deliveryContext,
-      getSummaryCardStateForWorkspace: () => summaryCardStateByWorkspace.get(workspaceRoot) || null,
-      setSummaryCardStateForWorkspace: (_bindingKey, _workspaceRoot, nextState = {}) => {
-        const previous = summaryCardStateByWorkspace.get(workspaceRoot) || {};
-        summaryCardStateByWorkspace.set(workspaceRoot, { ...previous, ...nextState });
-      },
       setSessionSyncStateForWorkspace: (_bindingKey, _workspaceRoot, nextState = {}) => {
         const previous = sessionSyncStateByWorkspace.get(workspaceRoot) || {};
         sessionSyncStateByWorkspace.set(workspaceRoot, {
           ...previous,
           ...nextState,
           threadId: nextState.threadId ?? previous.threadId ?? "",
-          sessionPath: nextState.sessionPath ?? previous.sessionPath ?? "",
-          readOffset: nextState.readOffset ?? previous.readOffset ?? 0,
-          lastRecordKey: nextState.lastRecordKey ?? previous.lastRecordKey ?? "",
-          lastSeenThreadUpdatedAt:
-            nextState.lastSeenThreadUpdatedAt ?? previous.lastSeenThreadUpdatedAt ?? 0,
-        });
+        sessionPath: nextState.sessionPath ?? previous.sessionPath ?? "",
+        readOffset: nextState.readOffset ?? previous.readOffset ?? 0,
+        lastRecordKey: nextState.lastRecordKey ?? previous.lastRecordKey ?? "",
+        lastTurnId: nextState.lastTurnId ?? previous.lastTurnId ?? "",
+        lastSeenThreadUpdatedAt:
+          nextState.lastSeenThreadUpdatedAt ?? previous.lastSeenThreadUpdatedAt ?? 0,
+      });
       },
       clearSessionSyncStateForWorkspace: () => {
         sessionSyncStateByWorkspace.delete(workspaceRoot);
@@ -98,7 +93,6 @@ function createSyncRuntime({
     reviewChainByMainThreadId: new Map(),
     markThreadHasExternalUpdates: () => {},
     buildExternalInputCard: (payload) => payload,
-    buildExternalSummaryCard: (payload) => payload,
     sendInteractiveCard: async () => ({
       data: {
         message_id: `msg-${++sentMessageCounter}`,
@@ -122,6 +116,65 @@ function createSyncRuntime({
     runtime,
     assistantCardCalls,
     getSessionSyncState: () => sessionSyncStateByWorkspace.get(workspaceRoot),
+  };
+}
+
+function createIntegratedReplyCardRuntime({
+  thread,
+  deliveryContext = {
+    chatId: "chat-1",
+    lastSourceMessageId: "msg-source",
+    updatedAt: "2026-03-24T16:40:00.000Z",
+  },
+  sessionSyncState = null,
+} = {}) {
+  const { runtime, getSessionSyncState } = createSyncRuntime({
+    thread,
+    deliveryContext,
+    sessionSyncState,
+  });
+  const assistantSentCards = [];
+  const assistantPatchedCards = [];
+
+  runtime.currentRunKeyByThreadId = new Map();
+  runtime.pendingChatContextByThreadId = new Map();
+  runtime.pendingReactionByThreadId = new Map();
+  runtime.replyCardByRunKey = new Map();
+  runtime.replyFlushTimersByRunKey = new Map();
+  runtime.setReplyCardEntry = function setReplyCardEntry(runKey, entry) {
+    this.replyCardByRunKey.set(runKey, entry);
+  };
+  runtime.setCurrentRunKeyForThread = function setCurrentRunKeyForThread(threadId, runKey) {
+    this.currentRunKeyByThreadId.set(threadId, runKey);
+  };
+  runtime.disposeReplyRunState = function disposeReplyRunState(runKey, threadId) {
+    this.replyCardByRunKey.delete(runKey);
+    if (this.currentRunKeyByThreadId.get(threadId) === runKey) {
+      this.currentRunKeyByThreadId.delete(threadId);
+    }
+  };
+  runtime.clearPendingReactionForThread = async () => {};
+  runtime.requireFeishuAdapter = () => ({
+    sendInteractiveCard: async (payload) => {
+      assistantSentCards.push(payload);
+      return {
+        data: {
+          message_id: `assistant-msg-${assistantSentCards.length}`,
+        },
+      };
+    },
+    patchInteractiveCard: async (payload) => {
+      assistantPatchedCards.push(payload);
+      return {};
+    },
+  });
+  runtime.upsertAssistantReplyCard = async (payload) => upsertAssistantReplyCard(runtime, payload);
+
+  return {
+    runtime,
+    assistantSentCards,
+    assistantPatchedCards,
+    getSessionSyncState,
   };
 }
 
@@ -261,7 +314,7 @@ test("parseMainThreadSessionChunk extracts user, assistant, and terminal turn re
   assert.ok(entries.every((entry) => entry.recordKey));
 });
 
-test("parseMainThreadSessionChunk strips codex-im system notes from synced user messages", () => {
+test("parseMainThreadSessionChunk preserves the full synced user message", () => {
   const chunk = [
     JSON.stringify({
       timestamp: "2026-03-24T15:00:00.000Z",
@@ -279,9 +332,8 @@ test("parseMainThreadSessionChunk strips codex-im system notes from synced user 
         message: [
           "[internal reviewer continue] finish the remaining work.",
           "",
-          "[codex-im system note]",
-          "Current main thread id for this conversation: thread-main",
-          "--session-id thread-main",
+          "extra context line 1",
+          "extra context line 2",
         ].join("\n"),
       },
     }),
@@ -294,7 +346,57 @@ test("parseMainThreadSessionChunk strips codex-im system notes from synced user 
 
   assert.equal(entries.length, 1);
   assert.equal(entries[0].kind, "user");
-  assert.equal(entries[0].text, "[internal reviewer continue] finish the remaining work.");
+  assert.equal(
+    entries[0].text,
+    [
+      "[internal reviewer continue] finish the remaining work.",
+      "",
+      "extra context line 1",
+      "extra context line 2",
+    ].join("\n")
+  );
+});
+
+test("parseMainThreadSessionChunkState keeps turn id continuity across chunk boundaries", () => {
+  const chunk = [
+    JSON.stringify({
+      timestamp: "2026-03-24T16:42:05.000Z",
+      type: "response_item",
+      payload: {
+        type: "message",
+        role: "assistant",
+        content: [
+          {
+            type: "output_text",
+            text: "continued answer",
+          },
+        ],
+      },
+    }),
+    JSON.stringify({
+      timestamp: "2026-03-24T16:42:06.000Z",
+      type: "event_msg",
+      payload: {
+        type: "task_complete",
+        turn_id: "turn-2",
+      },
+    }),
+    "",
+  ].join("\n");
+
+  const result = parseMainThreadSessionChunkState(chunk, {
+    threadId: "thread-1",
+    initialTurnId: "turn-2",
+  });
+
+  assert.equal(result.lastTurnId, "turn-2");
+  assert.deepEqual(
+    result.entries.map((entry) => ({ kind: entry.kind, turnId: entry.turnId, text: entry.text || "", state: entry.state || "" })),
+    [
+      { kind: "assistant", turnId: "turn-2", text: "continued answer", state: "" },
+      { kind: "turn_state", turnId: "turn-2", text: "", state: "completed" },
+    ]
+  );
 });
 
 test("parseMainThreadSessionChunk preserves multiple assistant messages in the same turn", () => {
@@ -350,19 +452,6 @@ test("parseMainThreadSessionChunk preserves multiple assistant messages in the s
     ]
   );
   assert.notEqual(entries[0].recordKey, entries[1].recordKey);
-});
-
-test("stripCodexImSystemNote removes the injected codex-im thread note", () => {
-  const text = [
-    "please continue the task",
-    "",
-    "[codex-im system note]",
-    "Current main thread id for this conversation: thread-main",
-    "If this turn uses slurm-codex-wakeup or runs slurm_resume.py submit, you must pass:",
-    "--session-id thread-main",
-  ].join("\n");
-
-  assert.equal(stripCodexImSystemNote(text), "please continue the task");
 });
 
 test("parseMainThreadSessionChunk skips the previously synced record key", () => {
@@ -519,7 +608,6 @@ test("maybeHandleExternalTurnCompletedReview skips duplicate completed turns", a
 test("finalizeIncompleteAssistantState re-dispatches long review when external output stops without a terminal event", async () => {
   const reviewCalls = [];
   const assistantCardCalls = [];
-  const summaryCardCalls = [];
   const runtime = {
     reviewChainByMainThreadId: new Map([
       ["thread-1", {
@@ -528,30 +616,9 @@ test("finalizeIncompleteAssistantState re-dispatches long review when external o
     ]),
     replyDetailByMessageId: new Map(),
     externalSummaryLabelByThreadId: new Map(),
-    sessionStore: {
-      getDeliveryContextForWorkspace: () => ({
-        chatId: "chat-1",
-        lastSourceMessageId: "msg-source",
-      }),
-      getSummaryCardStateForWorkspace: () => null,
-      setSummaryCardStateForWorkspace: () => {},
-    },
     upsertAssistantReplyCard: async (payload) => {
       assistantCardCalls.push(payload);
     },
-    buildExternalSummaryCard: (payload) => {
-      summaryCardCalls.push(payload);
-      return {
-        payload,
-      };
-    },
-    sendInteractiveCard: async () => ({
-      data: {
-        message_id: "summary-msg-1",
-      },
-    }),
-    patchInteractiveCard: async () => {},
-    linkReplyDetailAlias: () => {},
     handleMainTurnCompleted: async (payload) => {
       reviewCalls.push(payload);
     },
@@ -584,7 +651,6 @@ test("finalizeIncompleteAssistantState re-dispatches long review when external o
     threadId: "thread-1",
     turnId: "turn-2",
   }]);
-  assert.equal(summaryCardCalls.length, 1);
 });
 
 test("syncExternalSessions skips replaying assistant text for a recently live-delivered turn", async () => {
@@ -648,7 +714,12 @@ test("syncExternalSessions skips replaying assistant text for a recently live-de
 
     await syncExternalSessions(runtime);
 
-    assert.deepEqual(assistantCardCalls, []);
+    assert.deepEqual(assistantCardCalls, [{
+      threadId: "thread-1",
+      turnId: "turn-1",
+      chatId: "chat-1",
+      state: "completed",
+    }]);
     assert.equal(runtime.recentLiveDeliveredTurnAtByRunKey.has("thread-1:turn-1"), false);
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
@@ -728,16 +799,24 @@ test("syncExternalSessions holds the cursor when a suspicious timeline chunk can
 
     await syncExternalSessions(runtime);
 
-    assert.deepEqual(assistantCardCalls, [{
-      threadId: "thread-1",
-      turnId: "turn-1",
-      itemId: "2026-03-25T11:24:01.000Z|response_item|message|assistant|turn-1|Recovered assistant output.",
-      chatId: "chat-1",
-      text: "Recovered assistant output.",
-      textMode: "replace",
-      state: "streaming",
-      deferFlush: false,
-    }]);
+    assert.deepEqual(assistantCardCalls, [
+      {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        itemId: "2026-03-25T11:24:01.000Z|response_item|message|assistant|turn-1|Recovered assistant output.",
+        chatId: "chat-1",
+        text: "Recovered assistant output.",
+        textMode: "replace",
+        state: "streaming",
+        deferFlush: false,
+      },
+      {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        chatId: "chat-1",
+        state: "completed",
+      },
+    ]);
     assert.equal(getSessionSyncState().readOffset > 0, true);
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
@@ -1006,22 +1085,272 @@ test("syncExternalSessions replays a same-thread resumed session file and re-dis
 
     await syncExternalSessions(runtime);
 
-    assert.deepEqual(assistantCardCalls, [{
-      threadId: "019d23a4-6292-7db1-8a89-f7fabf95ae03",
-      turnId: "turn-new",
-      itemId: "2026-03-24T16:42:05.000Z|response_item|message|assistant|turn-new|Recovered work from the resumed session.",
-      chatId: "chat-1",
-      text: "Recovered work from the resumed session.",
-      textMode: "replace",
-      state: "streaming",
-      deferFlush: false,
-    }]);
+    assert.deepEqual(assistantCardCalls, [
+      {
+        threadId: "019d23a4-6292-7db1-8a89-f7fabf95ae03",
+        turnId: "turn-new",
+        itemId: "2026-03-24T16:42:05.000Z|response_item|message|assistant|turn-new|Recovered work from the resumed session.",
+        chatId: "chat-1",
+        text: "Recovered work from the resumed session.",
+        textMode: "replace",
+        state: "streaming",
+        deferFlush: false,
+      },
+      {
+        threadId: "019d23a4-6292-7db1-8a89-f7fabf95ae03",
+        turnId: "turn-new",
+        chatId: "chat-1",
+        state: "completed",
+      },
+    ]);
     assert.deepEqual(reviewCalls, [{
       threadId: "019d23a4-6292-7db1-8a89-f7fabf95ae03",
       turnId: "turn-new",
     }]);
     assert.equal(getSessionSyncState().sessionPath, nextSessionPath);
     assert.equal(getSessionSyncState().readOffset, fs.statSync(nextSessionPath).size);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("syncExternalSessions opens a fresh assistant card for the next external turn in the same thread", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-im-external-sync-next-turn-"));
+  try {
+    const sessionPath = path.join(tempDir, "thread-1.jsonl");
+    fs.writeFileSync(sessionPath, [
+      JSON.stringify({
+        timestamp: "2026-03-24T16:48:00.000Z",
+        type: "event_msg",
+        payload: {
+          type: "task_started",
+          turn_id: "turn-1",
+        },
+      }),
+      JSON.stringify({
+        timestamp: "2026-03-24T16:48:00.100Z",
+        type: "event_msg",
+        payload: {
+          type: "user_message",
+          message: "first question",
+        },
+      }),
+      JSON.stringify({
+        timestamp: "2026-03-24T16:48:01.000Z",
+        type: "response_item",
+        payload: {
+          type: "message",
+          role: "assistant",
+          content: [
+            {
+              type: "output_text",
+              text: "first answer",
+            },
+          ],
+        },
+      }),
+      JSON.stringify({
+        timestamp: "2026-03-24T16:48:02.000Z",
+        type: "event_msg",
+        payload: {
+          type: "task_complete",
+          turn_id: "turn-1",
+        },
+      }),
+      JSON.stringify({
+        timestamp: "2026-03-24T16:49:00.000Z",
+        type: "event_msg",
+        payload: {
+          type: "task_started",
+          turn_id: "turn-2",
+        },
+      }),
+      JSON.stringify({
+        timestamp: "2026-03-24T16:49:00.100Z",
+        type: "event_msg",
+        payload: {
+          type: "user_message",
+          message: "second question",
+        },
+      }),
+      "",
+    ].join("\n"));
+
+    const {
+      runtime,
+      assistantSentCards,
+      assistantPatchedCards,
+      getSessionSyncState,
+    } = createIntegratedReplyCardRuntime({
+      thread: {
+        id: "thread-1",
+        updatedAt: 100,
+        path: sessionPath,
+        statusType: "completed",
+      },
+      sessionSyncState: {
+        threadId: "thread-1",
+        sessionPath,
+        readOffset: 0,
+        lastRecordKey: "",
+        lastTurnId: "",
+        lastSeenThreadUpdatedAt: 0,
+      },
+    });
+
+    await syncExternalSessions(runtime);
+
+    assert.equal(assistantSentCards.length, 1);
+    assert.equal(assistantPatchedCards.length, 1);
+    assert.equal(getSessionSyncState().lastTurnId, "turn-2");
+
+    fs.appendFileSync(sessionPath, [
+      JSON.stringify({
+        timestamp: "2026-03-24T16:49:01.000Z",
+        type: "response_item",
+        payload: {
+          type: "message",
+          role: "assistant",
+          content: [
+            {
+              type: "output_text",
+              text: "second answer",
+            },
+          ],
+        },
+      }),
+      JSON.stringify({
+        timestamp: "2026-03-24T16:49:02.000Z",
+        type: "event_msg",
+        payload: {
+          type: "task_complete",
+          turn_id: "turn-2",
+        },
+      }),
+      "",
+    ].join("\n"));
+
+    await syncExternalSessions(runtime);
+
+    assert.equal(assistantSentCards.length, 2);
+    assert.equal(assistantPatchedCards.length, 2);
+    assert.equal(assistantPatchedCards[1].messageId, "assistant-msg-2");
+    assert.equal(runtime.replyDetailByMessageId.get("assistant-msg-2").turnId, "turn-2");
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("syncExternalSessions keeps one assistant card for multiple assistant updates within the same turn", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-im-external-sync-same-turn-"));
+  try {
+    const sessionPath = path.join(tempDir, "thread-1.jsonl");
+    fs.writeFileSync(sessionPath, [
+      JSON.stringify({
+        timestamp: "2026-03-24T16:58:00.000Z",
+        type: "event_msg",
+        payload: {
+          type: "task_started",
+          turn_id: "turn-1",
+        },
+      }),
+      JSON.stringify({
+        timestamp: "2026-03-24T16:58:00.100Z",
+        type: "event_msg",
+        payload: {
+          type: "user_message",
+          message: "same question",
+        },
+      }),
+      JSON.stringify({
+        timestamp: "2026-03-24T16:58:01.000Z",
+        type: "response_item",
+        payload: {
+          type: "message",
+          role: "assistant",
+          content: [
+            {
+              type: "output_text",
+              text: "first step",
+            },
+          ],
+        },
+      }),
+      "",
+    ].join("\n"));
+
+    const {
+      runtime,
+      assistantSentCards,
+      assistantPatchedCards,
+    } = createIntegratedReplyCardRuntime({
+      thread: {
+        id: "thread-1",
+        updatedAt: 100,
+        path: sessionPath,
+        statusType: "completed",
+      },
+      sessionSyncState: {
+        threadId: "thread-1",
+        sessionPath,
+        readOffset: 0,
+        lastRecordKey: "",
+        lastTurnId: "",
+        lastSeenThreadUpdatedAt: 0,
+      },
+    });
+
+    await syncExternalSessions(runtime);
+
+    assert.equal(assistantSentCards.length, 1);
+    assert.equal(assistantPatchedCards.length, 0);
+
+    fs.appendFileSync(sessionPath, [
+      JSON.stringify({
+        timestamp: "2026-03-24T16:58:05.000Z",
+        type: "response_item",
+        payload: {
+          type: "message",
+          role: "assistant",
+          content: [
+            {
+              type: "output_text",
+              text: "second step",
+            },
+          ],
+        },
+      }),
+      JSON.stringify({
+        timestamp: "2026-03-24T16:58:10.000Z",
+        type: "response_item",
+        payload: {
+          type: "message",
+          role: "assistant",
+          content: [
+            {
+              type: "output_text",
+              text: "final step",
+            },
+          ],
+        },
+      }),
+      JSON.stringify({
+        timestamp: "2026-03-24T16:58:11.000Z",
+        type: "event_msg",
+        payload: {
+          type: "task_complete",
+          turn_id: "turn-1",
+        },
+      }),
+      "",
+    ].join("\n"));
+
+    await syncExternalSessions(runtime);
+
+    assert.equal(assistantSentCards.length, 1);
+    assert.equal(assistantPatchedCards.length, 1);
+    assert.ok(assistantPatchedCards.every((payload) => payload.messageId === "assistant-msg-1"));
+    assert.equal(runtime.replyDetailByMessageId.get("assistant-msg-1").turnId, "turn-1");
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }

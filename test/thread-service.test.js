@@ -7,6 +7,7 @@ const path = require("node:path");
 const {
   ensureThreadAndSendMessage,
   ensureThreadResumed,
+  handleNewCommand,
   refreshWorkspaceThreads,
   resolveWorkspaceThreadState,
 } = require("../src/domain/thread/thread-service");
@@ -147,6 +148,65 @@ test("ensureThreadAndSendMessage rejects when no thread is selected instead of a
     /不会自动新建/
   );
   assert.equal(startThreadCalled, false);
+});
+
+test("handleNewCommand sends only the creation info card without opening the status panel", async () => {
+  const sentInfoCards = [];
+  let statusPanelCalled = false;
+  let persistedThread = null;
+  const runtime = {
+    codex: {
+      startThread: async () => ({
+        result: {
+          thread: {
+            id: "thread-new",
+            path: "/tmp/thread-new.jsonl",
+          },
+        },
+      }),
+    },
+    sessionStore: {
+      buildBindingKey() {
+        return "binding-1";
+      },
+      setThreadIdForWorkspace(bindingKey, workspaceRoot, threadId) {
+        persistedThread = { bindingKey, workspaceRoot, threadId };
+      },
+    },
+    resolveWorkspaceRootForBinding() {
+      return "/repo";
+    },
+    sendInfoCardMessage: async (payload) => {
+      sentInfoCards.push(payload);
+    },
+    showStatusPanel: async () => {
+      statusPanelCalled = true;
+    },
+    resumedThreadIds: new Set(),
+    threadSessionPathByThreadId: new Map(),
+    freshThreadIds: new Set(),
+    placeholderThreadIds: new Set(),
+    setPendingThreadContext() {},
+    setThreadBindingKey() {},
+    setThreadWorkspaceRoot() {},
+  };
+
+  await handleNewCommand(runtime, {
+    chatId: "chat-1",
+    messageId: "msg-1",
+  });
+
+  assert.deepEqual(persistedThread, {
+    bindingKey: "binding-1",
+    workspaceRoot: "/repo",
+    threadId: "thread-new",
+  });
+  assert.deepEqual(sentInfoCards, [{
+    chatId: "chat-1",
+    replyToMessageId: "msg-1",
+    text: "已创建新线程并切换到它:\n/repo\n\nthread: thread-new",
+  }]);
+  assert.equal(statusPanelCalled, false);
 });
 
 test("resolveWorkspaceThreadState preserves a visible stored thread even if selection logic returns empty", async () => {
@@ -513,7 +573,7 @@ test("ensureThreadAndSendMessage refreshes the Codex client before resuming thre
   assert.deepEqual(calls, ["refresh", "resume", "send", "clear:thread-1"]);
 });
 
-test("ensureThreadAndSendMessage injects the literal main thread id into outbound main-thread prompts", async () => {
+test("ensureThreadAndSendMessage keeps outbound main-thread prompts unchanged", async () => {
   let sentPayload = null;
   const sessionPath = makeTempSessionFile("thread-main.jsonl");
   const runtime = {
@@ -556,14 +616,10 @@ test("ensureThreadAndSendMessage injects the literal main thread id into outboun
   });
 
   assert.ok(sentPayload);
-  assert.match(sentPayload.text, /please request one A100 and use slurm wakeup/);
-  assert.match(sentPayload.text, /\[codex-im system note\]/);
-  assert.match(sentPayload.text, /Current main thread id for this conversation: thread-main/);
-  assert.match(sentPayload.text, /--session-id thread-main/);
-  assert.match(sentPayload.text, /Do not use \$CODEX_THREAD_ID or \$CODEX_SESSION_ID/);
+  assert.equal(sentPayload.text, "please request one A100 and use slurm wakeup");
 });
 
-test("ensureThreadAndSendMessage does not inject the main-thread id note into reviewer-thread prompts", async () => {
+test("ensureThreadAndSendMessage keeps reviewer-thread prompts unchanged", async () => {
   let sentPayload = null;
   const sessionPath = makeTempSessionFile("thread-reviewer.jsonl");
   const runtime = {

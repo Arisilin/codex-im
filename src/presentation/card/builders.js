@@ -185,67 +185,6 @@ function buildExternalInputCard({ title, text }) {
   };
 }
 
-function buildExternalSummaryCard({ state, detailAction = null, latestLabel = "" }) {
-  const normalizedState = state || "streaming";
-  const stateLabel = normalizedState === "failed"
-    ? " · ❌ 执行失败"
-    : normalizedState === "completed"
-      ? " · ✅ 已完成"
-      : " · ⏳ 处理中";
-  const sourceLine = normalizeIdentifier(latestLabel)
-    ? `最近来源：${escapeCardMarkdown(latestLabel)}`
-    : "外部与自动输入已同步到当前会话。";
-  const actionElements = detailAction
-    ? [
-      { tag: "hr" },
-      {
-        tag: "column_set",
-        flex_mode: "stretch",
-        columns: [
-          {
-            tag: "column",
-            width: "weighted",
-            weight: 1,
-            elements: [
-              {
-                tag: "button",
-                text: {
-                  tag: "plain_text",
-                  content: normalizedState === "streaming" ? "查看当前完整输出" : "查看完整输出",
-                },
-                value: detailAction,
-              },
-            ],
-          },
-        ],
-      },
-    ]
-    : [];
-
-  return {
-    schema: "2.0",
-    config: {
-      wide_screen_mode: true,
-      update_multi: true,
-    },
-    body: {
-      elements: [
-        {
-          tag: "markdown",
-          content: `**🤖 Codex 完整输出**${stateLabel}`,
-          text_size: "notation",
-        },
-        {
-          tag: "markdown",
-          content: sourceLine,
-          text_size: "notation",
-        },
-        ...actionElements,
-      ],
-    },
-  };
-}
-
 function buildAssistantDetailCard({ text, state }) {
   const normalizedState = state || "streaming";
   const stateLabel = normalizedState === "failed"
@@ -865,7 +804,14 @@ function buildSubagentStatusCard({ thread, state = "created", summary = "" }) {
   };
 }
 
-function buildSubagentTranscriptCard({ threadId, agentNickname = "", agentRole = "", state = "", messages }) {
+function buildSubagentTranscriptCard({
+  threadId,
+  agentNickname = "",
+  agentRole = "",
+  state = "",
+  messages,
+  forkContext = false,
+}) {
   const identity = formatSubagentIdentity({
     agentNickname,
     agentRole,
@@ -882,6 +828,7 @@ function buildSubagentTranscriptCard({ threadId, agentNickname = "", agentRole =
       content: [
         agentRole ? `角色：${escapeCardMarkdown(agentRole)}` : "",
         threadId ? `子代理ID：\`${escapeCardMarkdown(threadId)}\`` : "",
+        forkContext ? "上下文：fork_context=true（继承上下文已隐藏）" : "",
       ].filter(Boolean).join("\n"),
       text_size: "notation",
     },
@@ -1770,7 +1717,6 @@ module.exports = {
   buildAssistantDetailCard,
   buildAssistantReplyCard,
   buildExternalInputCard,
-  buildExternalSummaryCard,
   buildCardResponse,
   buildCardToast,
   buildHelpCardText,

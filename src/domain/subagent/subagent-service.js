@@ -184,6 +184,8 @@ function stopTracking(runtime, runKey) {
 
 async function syncSubagentThread(runtime, tracker, thread) {
   const existing = runtime.subagentCardByThreadId.get(thread.id) || null;
+  const nextForkContext = resolveSubagentForkContext(thread.forkContext, existing?.forkContext);
+  const detailMessages = appendDetailMessages(existing?.detailMessages, []);
 
   if (!existing) {
     const response = await runtime.sendInteractiveCard({
@@ -209,7 +211,9 @@ async function syncSubagentThread(runtime, tracker, thread) {
       path: thread.path || "",
       detailMessageId: "",
       historyMessages: [],
+      detailMessages,
       transcriptMessages: [],
+      forkContext: nextForkContext,
     });
   }
 
@@ -230,10 +234,20 @@ async function syncSubagentThread(runtime, tracker, thread) {
     return;
   }
 
-  const transcriptMessages = normalizeConversationMessages(transcript.messages);
+  const transcriptMessages = filterSubagentTranscriptMessages(
+    normalizeConversationMessages(transcript.messages),
+    detailMessages,
+    { forkContext: nextForkContext }
+  );
   const agentNickname = transcript.agentNickname || thread.agentNickname || cardState.nickname || "";
   const agentRole = transcript.agentRole || thread.agentRole || cardState.role || "";
-  const summary = buildSubagentSummary(transcriptMessages, { state: "completed" });
+  const summary = buildSubagentSummary(
+    transcriptMessages.length ? transcriptMessages : detailMessages,
+    {
+      state: "completed",
+      fallbackSummary: cardState.lastSummary || "",
+    }
+  );
   const shouldPatch = (
     cardState.state !== "completed"
     || cardState.lastSummary !== summary
@@ -267,60 +281,25 @@ async function syncSubagentThread(runtime, tracker, thread) {
     nickname: agentNickname,
     role: agentRole,
     path: thread.path || cardState.path || "",
+    detailMessages,
     transcriptMessages,
+    forkContext: nextForkContext,
   };
   runtime.subagentCardByThreadId.set(thread.id, nextEntry);
 
   await syncOpenSubagentDetailCard(runtime, nextEntry, {
     state: "completed",
-    messages: transcriptMessages,
+    messages: transcriptMessages.length ? transcriptMessages : detailMessages,
     agentNickname,
     agentRole,
+    forkContext: nextForkContext,
   });
 }
 
 async function showSubagentTranscript(runtime, normalized, threadId) {
   const threadEntry = runtime.subagentCardByThreadId.get(threadId) || { threadId };
-  if ((threadEntry.source || "") === "session") {
-    const metadata = await resolveSubagentMetadataFromThreadId(runtime, threadId, threadEntry.path || "");
-    const nextEntry = {
-      ...threadEntry,
-      nickname: metadata.agentNickname || threadEntry.nickname || "",
-      role: metadata.agentRole || threadEntry.role || "",
-    };
-    const card = runtime.buildSubagentTranscriptCard({
-      threadId,
-      agentNickname: nextEntry.nickname,
-      agentRole: nextEntry.role,
-      state: threadEntry.state || "",
-      messages: buildStoredSubagentMessages(nextEntry).length
-        ? buildStoredSubagentMessages(nextEntry)
-        : buildFallbackDetailMessages(nextEntry),
-    });
-
-    if (nextEntry.detailMessageId) {
-      await runtime.patchInteractiveCard({
-        messageId: nextEntry.detailMessageId,
-        card,
-      });
-      runtime.subagentCardByThreadId.set(threadId, nextEntry);
-      return;
-    }
-
-    const response = await runtime.sendInteractiveCard({
-      chatId: normalized.chatId,
-      replyToMessageId: normalized.messageId,
-      replyInThread: true,
-      card,
-    });
-    runtime.subagentCardByThreadId.set(threadId, {
-      ...nextEntry,
-      detailMessageId: codexMessageUtils.extractCreatedMessageId(response) || "",
-    });
-    return;
-  }
-
   const metadata = await resolveSubagentMetadataFromThreadId(runtime, threadId, threadEntry.path || "");
+  const nextForkContext = resolveSubagentForkContext(metadata.forkContext, threadEntry.forkContext);
   const display = await loadSubagentDisplay(runtime, {
     id: threadId,
     agentNickname: metadata.agentNickname || threadEntry.nickname || "",
@@ -330,12 +309,15 @@ async function showSubagentTranscript(runtime, normalized, threadId) {
     fallbackMessages: buildStoredSubagentMessages(threadEntry),
     fallbackSummary: threadEntry.lastSummary || "",
     requireComplete: false,
+    forkContext: nextForkContext,
+    explicitMessages: Array.isArray(threadEntry.detailMessages) ? threadEntry.detailMessages : [],
   });
   const messages = display.messages.length ? display.messages : buildFallbackDetailMessages(threadEntry);
   const nextEntry = {
     ...threadEntry,
     nickname: display.agentNickname || metadata.agentNickname || threadEntry.nickname || "",
     role: display.agentRole || metadata.agentRole || threadEntry.role || "",
+    forkContext: nextForkContext,
     transcriptMessages: display.transcriptMessages.length
       ? display.transcriptMessages
       : Array.isArray(threadEntry.transcriptMessages) ? threadEntry.transcriptMessages : [],
@@ -346,6 +328,7 @@ async function showSubagentTranscript(runtime, normalized, threadId) {
     agentRole: nextEntry.role,
     state: threadEntry.state || "",
     messages,
+    forkContext: nextForkContext,
   });
 
   if (nextEntry.detailMessageId) {
@@ -445,6 +428,9 @@ async function syncSubagentsFromParentSession(runtime, tracker) {
       state: normalizedStatus.state,
       summary: normalizedStatus.summary,
       historyText: normalizedStatus.historyText,
+      detailEntries: normalizedStatus.historyText
+        ? [{ role: "assistant", text: normalizedStatus.historyText }]
+        : [],
     });
   }
 
@@ -454,22 +440,29 @@ async function syncSubagentsFromParentSession(runtime, tracker) {
 
 async function resolveParentSessionPath(runtime, tracker) {
   const fromTracker = normalizeIdentifier(tracker?.parentSessionPath);
-  if (fromTracker) {
+  if (fromTracker && await doesSessionPathBelongToThread(fromTracker, tracker.parentThreadId)) {
     return fromTracker;
   }
-  const fromRuntime = normalizeIdentifier(runtime.threadSessionPathByThreadId.get(tracker.parentThreadId) || "");
-  if (fromRuntime) {
-    tracker.parentSessionPath = fromRuntime;
+  if (fromTracker) {
+    debugSubagent(`discard stale tracker session path runKey=${tracker.runKey} path=${fromTracker}`);
+    tracker.parentSessionPath = "";
     runtime.subagentTrackerByRunKey.set(tracker.runKey, tracker);
   }
-  if (fromRuntime) {
+  const fromRuntime = normalizeIdentifier(runtime.threadSessionPathByThreadId.get(tracker.parentThreadId) || "");
+  if (fromRuntime && await doesSessionPathBelongToThread(fromRuntime, tracker.parentThreadId)) {
+    tracker.parentSessionPath = fromRuntime;
+    runtime.subagentTrackerByRunKey.set(tracker.runKey, tracker);
     return fromRuntime;
+  }
+  if (fromRuntime) {
+    debugSubagent(`discard stale runtime session path thread=${tracker.parentThreadId} path=${fromRuntime}`);
+    runtime.threadSessionPathByThreadId.delete(tracker.parentThreadId);
   }
 
   try {
     const response = await runtime.codex.resumeThread({ threadId: tracker.parentThreadId });
     const resumedPath = codexMessageUtils.extractThreadPath(response);
-    if (resumedPath) {
+    if (resumedPath && await doesSessionPathBelongToThread(resumedPath, tracker.parentThreadId)) {
       tracker.parentSessionPath = resumedPath;
       runtime.threadSessionPathByThreadId.set(tracker.parentThreadId, resumedPath);
       runtime.subagentTrackerByRunKey.set(tracker.runKey, tracker);
@@ -480,6 +473,34 @@ async function resolveParentSessionPath(runtime, tracker) {
   }
 
   return "";
+}
+
+async function doesSessionPathBelongToThread(sessionPath, threadId) {
+  const normalizedPath = normalizeIdentifier(sessionPath);
+  const normalizedThreadId = normalizeIdentifier(threadId);
+  if (!normalizedPath || !normalizedThreadId) {
+    return false;
+  }
+
+  if (normalizedPath.includes(normalizedThreadId)) {
+    return true;
+  }
+
+  try {
+    const fileHandle = await fs.promises.open(normalizedPath, "r");
+    try {
+      const buffer = Buffer.alloc(4096);
+      const { bytesRead } = await fileHandle.read(buffer, 0, buffer.length, 0);
+      const firstChunk = buffer.slice(0, bytesRead).toString("utf8");
+      const firstLine = firstChunk.split(/\r?\n/, 1)[0] || "";
+      const record = firstLine ? JSON.parse(firstLine) : null;
+      return normalizeIdentifier(record?.payload?.id) === normalizedThreadId;
+    } finally {
+      await fileHandle.close();
+    }
+  } catch {
+    return false;
+  }
 }
 
 function parseJsonLine(line) {
@@ -573,6 +594,7 @@ function extractSpawnAgentUpdate(toolOutput) {
     agentNickname: nickname,
     agentRole: normalizeIdentifier(toolOutput?.args?.agent_type),
     state: "created",
+    forkContext: toolOutput?.args?.fork_context === true,
     summary: "",
     historyEntries: prompt
       ? [{ role: "user", text: prompt }]
@@ -580,6 +602,7 @@ function extractSpawnAgentUpdate(toolOutput) {
         role: "assistant",
         text: nickname ? `已创建子代理 ${nickname}。` : `已创建子代理 ${agentId}。`,
       }],
+    detailEntries: prompt ? [{ role: "user", text: prompt }] : [],
   };
 }
 
@@ -597,6 +620,7 @@ function extractSendInputUpdate(toolCall) {
     state: "running",
     summary: "",
     historyEntries: [{ role: "user", text: messageText }],
+    detailEntries: [{ role: "user", text: messageText }],
   };
 }
 
@@ -621,6 +645,9 @@ function extractWaitAgentUpdates(toolOutput) {
         historyEntries: normalizedStatus.historyText
           ? [{ role: "assistant", text: normalizedStatus.historyText }]
           : [],
+        detailEntries: normalizedStatus.historyText
+          ? [{ role: "assistant", text: normalizedStatus.historyText }]
+          : [],
       };
     })
     .filter(Boolean);
@@ -636,6 +663,7 @@ function extractCloseAgentUpdate(toolOutput) {
     state: "shutdown",
     summary: "",
     historyEntries: [{ role: "assistant", text: "子代理已关闭。" }],
+    detailEntries: [{ role: "assistant", text: "子代理已关闭。" }],
   };
 }
 
@@ -742,21 +770,44 @@ function normalizeNotificationStatus(status) {
 async function syncSessionBackedSubagent(runtime, tracker, subagent) {
   const existing = runtime.subagentCardByThreadId.get(subagent.id) || null;
   const historyMessages = appendHistoryEntries(existing?.historyMessages, buildHistoryEntries(subagent));
+  const detailMessages = appendDetailMessages(existing?.detailMessages, buildDetailEntries(subagent));
   const nextState = chooseSessionBackedState(existing?.state, subagent.state);
+  const nextForkContext = resolveSubagentForkContext(subagent.forkContext, existing?.forkContext);
   const threadLike = {
     id: subagent.id,
     agentNickname: subagent.agentNickname || existing?.nickname || "",
     agentRole: subagent.agentRole || existing?.role || "",
+    forkContext: nextForkContext,
   };
-  const display = {
+  const fallbackDisplay = {
     agentNickname: threadLike.agentNickname,
     agentRole: threadLike.agentRole,
-    messages: normalizeConversationMessages(historyMessages),
+    messages: normalizeConversationMessages(detailMessages),
     transcriptMessages: Array.isArray(existing?.transcriptMessages) ? existing.transcriptMessages : [],
     summary: buildSubagentSummary(historyMessages, {
       state: nextState,
       fallbackSummary: subagent.summary || existing?.lastSummary || "",
     }),
+  };
+  const shouldLoadTranscript = nextState === "completed" || nextState === "errored" || nextState === "shutdown";
+  const resolvedDisplay = shouldLoadTranscript
+    ? await loadSubagentDisplay(runtime, threadLike, {
+      state: nextState,
+      fallbackMessages: detailMessages,
+      fallbackSummary: subagent.summary || existing?.lastSummary || "",
+      requireComplete: false,
+      forkContext: nextForkContext,
+      explicitMessages: detailMessages,
+    })
+    : fallbackDisplay;
+  const display = {
+    agentNickname: resolvedDisplay.agentNickname || fallbackDisplay.agentNickname,
+    agentRole: resolvedDisplay.agentRole || fallbackDisplay.agentRole,
+    messages: resolvedDisplay.messages.length ? resolvedDisplay.messages : fallbackDisplay.messages,
+    transcriptMessages: resolvedDisplay.transcriptMessages.length
+      ? resolvedDisplay.transcriptMessages
+      : fallbackDisplay.transcriptMessages,
+    summary: resolvedDisplay.summary || fallbackDisplay.summary,
   };
   const nextSummary = display.summary;
   const transcriptMessages = display.transcriptMessages.length
@@ -794,7 +845,9 @@ async function syncSessionBackedSubagent(runtime, tracker, subagent) {
       path: "",
       source: "session",
       historyMessages,
+      detailMessages,
       transcriptMessages,
+      forkContext: nextForkContext,
       detailMessageId: "",
     });
     return;
@@ -832,7 +885,9 @@ async function syncSessionBackedSubagent(runtime, tracker, subagent) {
     role: nextRole,
     source: "session",
     historyMessages,
+    detailMessages,
     transcriptMessages,
+    forkContext: nextForkContext,
   };
   runtime.subagentCardByThreadId.set(subagent.id, nextEntry);
 
@@ -841,6 +896,7 @@ async function syncSessionBackedSubagent(runtime, tracker, subagent) {
     messages: display.messages.length ? display.messages : buildFallbackDetailMessages(nextEntry),
     agentNickname: nextNickname,
     agentRole: nextRole,
+    forkContext: nextForkContext,
   });
 }
 
@@ -853,6 +909,13 @@ function buildHistoryEntries(subagent) {
     return [];
   }
   return [{ role: "assistant", text: normalizedText }];
+}
+
+function buildDetailEntries(subagent) {
+  if (Array.isArray(subagent?.detailEntries)) {
+    return subagent.detailEntries;
+  }
+  return buildHistoryEntries(subagent);
 }
 
 function appendHistoryEntries(historyMessages, entries) {
@@ -870,6 +933,10 @@ function appendHistoryEntries(historyMessages, entries) {
     next.push(entry);
   }
   return next;
+}
+
+function appendDetailMessages(detailMessages, entries) {
+  return appendHistoryEntries(detailMessages, entries);
 }
 
 function chooseSessionBackedState(previousState, nextState) {
@@ -936,9 +1003,15 @@ async function loadSubagentDisplay(runtime, thread, {
   fallbackMessages = [],
   fallbackSummary = "",
   requireComplete = false,
+  forkContext = false,
+  explicitMessages = [],
 } = {}) {
   const transcript = await tryLoadSubagentTranscript(runtime, thread);
-  const transcriptMessages = normalizeConversationMessages(transcript?.messages);
+  const transcriptMessages = filterSubagentTranscriptMessages(
+    normalizeConversationMessages(transcript?.messages),
+    explicitMessages,
+    { forkContext }
+  );
   const canUseTranscript = transcriptMessages.length > 0 && (!requireComplete || !!transcript?.isComplete);
   const messages = canUseTranscript
     ? transcriptMessages
@@ -965,6 +1038,7 @@ async function syncOpenSubagentDetailCard(runtime, threadEntry, detail) {
         agentNickname: detail.agentNickname || threadEntry.nickname || "",
         agentRole: detail.agentRole || threadEntry.role || "",
         state: detail.state || threadEntry.state || "",
+        forkContext: detail.forkContext === true || threadEntry.forkContext === true,
         messages: Array.isArray(detail.messages) && detail.messages.length
           ? detail.messages
           : buildFallbackDetailMessages(threadEntry),
@@ -979,10 +1053,48 @@ function buildStoredSubagentMessages(threadEntry) {
   if (Array.isArray(threadEntry?.transcriptMessages) && threadEntry.transcriptMessages.length) {
     return threadEntry.transcriptMessages;
   }
+  if (Array.isArray(threadEntry?.detailMessages) && threadEntry.detailMessages.length) {
+    return threadEntry.detailMessages;
+  }
   if (Array.isArray(threadEntry?.historyMessages) && threadEntry.historyMessages.length) {
     return threadEntry.historyMessages;
   }
   return [];
+}
+
+function filterSubagentTranscriptMessages(transcriptMessages, explicitMessages, { forkContext = false } = {}) {
+  const normalizedTranscriptMessages = normalizeConversationMessages(transcriptMessages);
+  if (!forkContext) {
+    return normalizedTranscriptMessages;
+  }
+
+  const normalizedExplicitMessages = normalizeConversationMessages(explicitMessages);
+  const firstExplicitUserText = normalizedExplicitMessages.find((message) => message.role === "user")?.text || "";
+  if (!firstExplicitUserText) {
+    return [];
+  }
+
+  const anchorIndex = normalizedTranscriptMessages.findIndex((message) => (
+    message.role === "user" && message.text === firstExplicitUserText
+  ));
+  if (anchorIndex < 0) {
+    return [];
+  }
+
+  return normalizedTranscriptMessages.slice(anchorIndex);
+}
+
+function resolveSubagentForkContext(nextValue, previousValue = false) {
+  if (nextValue === true) {
+    return true;
+  }
+  if (previousValue === true) {
+    return true;
+  }
+  if (nextValue === false) {
+    return false;
+  }
+  return false;
 }
 
 function buildSubagentSummary(messages, { state = "", fallbackSummary = "" } = {}) {
@@ -1090,11 +1202,12 @@ function isSubagentSourceKind(sourceKind) {
 }
 
 async function resolveSubagentThreadMetadata(runtime, thread) {
-  if (thread.parentThreadId && (thread.agentNickname || thread.agentRole)) {
+  if (thread.parentThreadId && (thread.agentNickname || thread.agentRole || typeof thread.forkContext === "boolean")) {
     return {
       parentThreadId: thread.parentThreadId,
       agentNickname: thread.agentNickname || "",
       agentRole: thread.agentRole || "",
+      forkContext: thread.forkContext === true,
       path: thread.path || "",
     };
   }
@@ -1109,7 +1222,7 @@ async function resolveSubagentMetadataFromThreadId(runtime, threadId, sessionPat
 
   const parsed = sessionPath
     ? await readSubagentSessionMeta(runtime, sessionPath)
-    : { parentThreadId: "", agentNickname: "", agentRole: "", path: sessionPath };
+    : { parentThreadId: "", agentNickname: "", agentRole: "", forkContext: false, path: sessionPath };
   runtime.subagentMetadataByThreadId.set(threadId, parsed);
   return parsed;
 }
@@ -1121,6 +1234,7 @@ async function readSubagentSessionMeta(runtime, sessionPath) {
       parentThreadId: "",
       agentNickname: "",
       agentRole: "",
+      forkContext: false,
       path: "",
     };
   }
@@ -1141,6 +1255,7 @@ async function readSubagentSessionMeta(runtime, sessionPath) {
       parentThreadId: normalizeIdentifier(threadSpawn.parent_thread_id),
       agentNickname: normalizeIdentifier(payload.agent_nickname || threadSpawn.agent_nickname),
       agentRole: normalizeIdentifier(payload.agent_role || threadSpawn.agent_role),
+      forkContext: normalizeIdentifier(payload.forked_from_id).length > 0,
       path: normalizedPath,
     };
     runtime.subagentSessionMetaByPath.set(normalizedPath, meta);
@@ -1151,6 +1266,7 @@ async function readSubagentSessionMeta(runtime, sessionPath) {
       parentThreadId: "",
       agentNickname: "",
       agentRole: "",
+      forkContext: false,
       path: normalizedPath,
     };
     runtime.subagentSessionMetaByPath.set(normalizedPath, fallback);
@@ -1218,4 +1334,5 @@ function truncateText(value, limit) {
 module.exports = {
   handleCodexLifecycleEvent,
   handleSubagentCardAction,
+  resolveParentSessionPath,
 };

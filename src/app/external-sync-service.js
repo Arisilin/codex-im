@@ -1,9 +1,6 @@
 const fs = require("fs");
 const path = require("path");
 const codexMessageUtils = require("../infra/codex/message-utils");
-const {
-  buildReplyActionValue,
-} = require("../presentation/card/builders");
 
 const EXTERNAL_SYNC_INTERVAL_MS = 2000;
 const THREAD_LIST_PAGE_LIMIT = 200;
@@ -12,7 +9,6 @@ const FEISHU_PROMPT_FINGERPRINT_TTL_MS = 15 * 60 * 1000;
 const LIVE_DELIVERED_TURN_REPLAY_TTL_MS = 5 * 60 * 1000;
 const SYNTHETIC_CONTINUE_PREFIX = "[internal reviewer continue]";
 const SLURM_WAKEUP_PROMPT_RE = /^SLURM job \S+ is now RUNNING on node /i;
-const CODEX_IM_SYSTEM_NOTE_PREFIX = "[codex-im system note]";
 const EXTERNAL_SYNC_INVARIANT_ERROR = "ExternalSyncInvariantError";
 const EXTERNAL_SYNC_DEBUG_LOG_PATH = process.env.CODEX_IM_EXTERNAL_SYNC_DEBUG_LOG
   || path.join(process.cwd(), "logs", "codex-im.external-sync.log");
@@ -255,6 +251,7 @@ async function syncTrackedBinding(runtime, trackedBinding, thread) {
     return;
   }
 
+  const preservedLastTurnId = sessionPathChanged ? "" : normalizeIdentifier(effectiveSyncState.lastTurnId);
   const sessionChunk = await readSessionChunk(sessionPath, offset);
   if (sessionChunk?.reason === "partial") {
     recordPartialChunkOrThrow(runtime, trackedBinding, {
@@ -282,16 +279,21 @@ async function syncTrackedBinding(runtime, trackedBinding, thread) {
         sessionPath,
         readOffset: sessionChunk?.nextOffset ?? offset,
         lastRecordKey: sessionPathChanged ? "" : effectiveSyncState.lastRecordKey,
+        lastTurnId: preservedLastTurnId,
         lastSeenThreadUpdatedAt: threadUpdatedAt || effectiveSyncState.lastSeenThreadUpdatedAt,
       }
     );
     return;
   }
 
-  const timelineEntries = parseMainThreadSessionChunk(sessionChunk.text, {
+  const timeline = parseMainThreadSessionChunkState(sessionChunk.text, {
     threadId: trackedBinding.threadId,
     lastRecordKey: sessionPathChanged ? "" : effectiveSyncState.lastRecordKey,
+    initialTurnId: sessionPathChanged ? "" : effectiveSyncState.lastTurnId,
   });
+  const timelineEntries = timeline.entries;
+  const resolvedLastTurnId = normalizeIdentifier(timeline.lastTurnId)
+    || preservedLastTurnId;
   const hasSuspiciousUnparsedTimelineChunk = (
     timelineEntries.length === 0
     && chunkContainsPotentialTimelineRecords(sessionChunk.text)
@@ -318,6 +320,7 @@ async function syncTrackedBinding(runtime, trackedBinding, thread) {
         sessionPath,
         readOffset: offset,
         lastRecordKey: sessionPathChanged ? "" : effectiveSyncState.lastRecordKey,
+        lastTurnId: resolvedLastTurnId,
         lastSeenThreadUpdatedAt: threadUpdatedAt || effectiveSyncState.lastSeenThreadUpdatedAt,
       }
     );
@@ -336,7 +339,6 @@ async function syncTrackedBinding(runtime, trackedBinding, thread) {
     for (const entry of timelineEntries) {
       await applyTimelineEntry(runtime, trackedBinding, entry, thread);
     }
-    await finalizeIncompleteAssistantState(runtime, trackedBinding, timelineEntries, thread);
   }
 
   const lastEntry = timelineEntries[timelineEntries.length - 1] || null;
@@ -348,6 +350,7 @@ async function syncTrackedBinding(runtime, trackedBinding, thread) {
       sessionPath,
       readOffset: sessionChunk.nextOffset,
       lastRecordKey: lastEntry?.recordKey || (sessionPathChanged ? "" : effectiveSyncState.lastRecordKey) || "",
+      lastTurnId: resolvedLastTurnId,
       lastSeenThreadUpdatedAt: threadUpdatedAt || effectiveSyncState.lastSeenThreadUpdatedAt,
     }
   );
@@ -373,6 +376,7 @@ async function initializeSessionSyncBaseline(runtime, trackedBinding, {
     sessionPath,
     readOffset: fileSize,
     lastRecordKey: "",
+    lastTurnId: "",
     lastSeenThreadUpdatedAt: threadUpdatedAt,
   });
 }
@@ -401,14 +405,6 @@ async function applyTimelineEntry(runtime, trackedBinding, entry, thread) {
       title: sourceKind.title,
       text: entry.text,
     });
-    await upsertExternalSummaryCard(runtime, {
-      bindingKey,
-      workspaceRoot,
-      threadId: trackedBinding.threadId,
-      turnId: entry.turnId,
-      state: "streaming",
-      latestLabel: sourceKind.title,
-    });
     return;
   }
 
@@ -436,13 +432,6 @@ async function applyTimelineEntry(runtime, trackedBinding, entry, thread) {
       state: "streaming",
       deferFlush: false,
     });
-    await upsertExternalSummaryCard(runtime, {
-      bindingKey,
-      workspaceRoot,
-      threadId: trackedBinding.threadId,
-      turnId: entry.turnId,
-      state: "streaming",
-    });
     return;
   }
 
@@ -451,21 +440,6 @@ async function applyTimelineEntry(runtime, trackedBinding, entry, thread) {
       threadId: trackedBinding.threadId,
       turnId: entry.turnId,
     });
-    if (entry.turnId && hasDeliveredAssistantTurn(runtime, trackedBinding.threadId, entry.turnId)) {
-      await upsertExternalSummaryCard(runtime, {
-        bindingKey,
-        workspaceRoot,
-        threadId: trackedBinding.threadId,
-        turnId: entry.turnId,
-        state: entry.state,
-      });
-      await maybeHandleExternalTurnCompletedReview(runtime, {
-        threadId: trackedBinding.threadId,
-        turnId: entry.turnId,
-        state: entry.state,
-      });
-      return;
-    }
     if (entry.turnId) {
       await runtime.upsertAssistantReplyCard({
         threadId: trackedBinding.threadId,
@@ -474,13 +448,6 @@ async function applyTimelineEntry(runtime, trackedBinding, entry, thread) {
         state: entry.state,
       });
     }
-    await upsertExternalSummaryCard(runtime, {
-      bindingKey,
-      workspaceRoot,
-      threadId: trackedBinding.threadId,
-      turnId: entry.turnId,
-      state: entry.state,
-    });
     await maybeHandleExternalTurnCompletedReview(runtime, {
       threadId: trackedBinding.threadId,
       turnId: entry.turnId,
@@ -565,13 +532,6 @@ async function finalizeIncompleteAssistantState(runtime, trackedBinding, timelin
     chatId: trackedBinding.deliveryContext?.chatId || "",
     state: "completed",
   });
-  await upsertExternalSummaryCard(runtime, {
-    bindingKey: trackedBinding.bindingKey,
-    workspaceRoot: trackedBinding.workspaceRoot,
-    threadId: trackedBinding.threadId,
-    turnId: lastAssistantEntry.turnId,
-    state: "completed",
-  });
   await maybeHandleExternalTurnCompletedReview(runtime, {
     threadId: trackedBinding.threadId,
     turnId: lastAssistantEntry.turnId,
@@ -591,74 +551,6 @@ async function appendExternalInputCard(runtime, { chatId, title, text }) {
       text,
     }),
   });
-}
-
-async function upsertExternalSummaryCard(runtime, {
-  bindingKey,
-  workspaceRoot,
-  threadId,
-  turnId = "",
-  state = "streaming",
-  latestLabel = "",
-}) {
-  const deliveryContext = runtime.sessionStore.getDeliveryContextForWorkspace(bindingKey, workspaceRoot) || null;
-  if (!deliveryContext?.chatId) {
-    return "";
-  }
-
-  const existing = runtime.sessionStore.getSummaryCardStateForWorkspace(bindingKey, workspaceRoot) || null;
-  const detailSourceMessageId = findReplyDetailSourceMessageId(runtime, { threadId, turnId });
-  const detailAction = detailSourceMessageId ? buildReplyActionValue("show_full") : null;
-  const nextLabel = normalizeIdentifier(latestLabel)
-    || runtime.externalSummaryLabelByThreadId.get(threadId)
-    || "";
-  const card = runtime.buildExternalSummaryCard({
-    state,
-    detailAction,
-    latestLabel: nextLabel,
-  });
-
-  let messageId = normalizeIdentifier(existing?.messageId);
-  if (messageId) {
-    try {
-      await runtime.patchInteractiveCard({
-        messageId,
-        card,
-      });
-    } catch (error) {
-      throw new Error(`failed to patch summary card ${messageId}: ${error.message}`);
-    }
-  }
-
-  if (!messageId) {
-    const response = await runtime.sendInteractiveCard({
-      chatId: deliveryContext.chatId,
-      replyToMessageId: deliveryContext.lastSourceMessageId || "",
-      card,
-    });
-    messageId = codexMessageUtils.extractCreatedMessageId(response);
-  }
-
-  if (!messageId) {
-    return "";
-  }
-
-  runtime.sessionStore.setSummaryCardStateForWorkspace(bindingKey, workspaceRoot, {
-    messageId,
-    threadId,
-    turnId,
-    state,
-  });
-  if (detailSourceMessageId) {
-    runtime.linkReplyDetailAlias({
-      aliasMessageId: messageId,
-      sourceMessageId: detailSourceMessageId,
-    });
-  }
-  if (nextLabel) {
-    runtime.externalSummaryLabelByThreadId.set(threadId, nextLabel);
-  }
-  return messageId;
 }
 
 async function maybeHandleExternalTurnCompletedReview(runtime, {
@@ -685,26 +577,6 @@ async function maybeHandleExternalTurnCompletedReview(runtime, {
     threadId: normalizedThreadId,
     turnId: normalizedTurnId,
   });
-}
-
-function findReplyDetailSourceMessageId(runtime, { threadId, turnId = "" }) {
-  const normalizedThreadId = normalizeIdentifier(threadId);
-  const normalizedTurnId = normalizeIdentifier(turnId);
-  if (!normalizedThreadId) {
-    return "";
-  }
-
-  let latestMessageId = "";
-  for (const [messageId, detail] of runtime.replyDetailByMessageId.entries()) {
-    if (detail?.threadId !== normalizedThreadId) {
-      continue;
-    }
-    if (normalizedTurnId && detail?.turnId !== normalizedTurnId) {
-      continue;
-    }
-    latestMessageId = messageId;
-  }
-  return latestMessageId;
 }
 
 function rememberFeishuPromptFingerprint(runtime, { threadId, text }) {
@@ -888,10 +760,14 @@ async function listThreadsPaginated(runtime) {
   return threads;
 }
 
-function parseMainThreadSessionChunk(rawChunk, { threadId = "", lastRecordKey = "" } = {}) {
+function parseMainThreadSessionChunkState(rawChunk, {
+  threadId = "",
+  lastRecordKey = "",
+  initialTurnId = "",
+} = {}) {
   const lines = String(rawChunk || "").split(/\r?\n/).filter(Boolean);
   const entries = [];
-  let currentTurnId = "";
+  let currentTurnId = normalizeIdentifier(initialTurnId);
   const normalizedLastRecordKey = normalizeIdentifier(lastRecordKey);
 
   for (const line of lines) {
@@ -914,15 +790,22 @@ function parseMainThreadSessionChunk(rawChunk, { threadId = "", lastRecordKey = 
   }
 
   if (!normalizedLastRecordKey) {
-    return entries;
+    return { entries, lastTurnId: currentTurnId };
   }
 
   const lastSeenIndex = entries.findIndex((entry) => entry.recordKey === normalizedLastRecordKey);
   if (lastSeenIndex < 0) {
-    return entries;
+    return { entries, lastTurnId: currentTurnId };
   }
 
-  return entries.slice(lastSeenIndex + 1);
+  return {
+    entries: entries.slice(lastSeenIndex + 1),
+    lastTurnId: currentTurnId,
+  };
+}
+
+function parseMainThreadSessionChunk(rawChunk, options = {}) {
+  return parseMainThreadSessionChunkState(rawChunk, options).entries;
 }
 
 function parseJsonLine(line) {
@@ -1028,7 +911,7 @@ function extractTimelineEntry(record, currentTurnId, threadId) {
   if (record?.type === "event_msg") {
     const eventType = normalizeIdentifier(payload?.type).toLowerCase();
     if (eventType === "user_message") {
-      const text = stripCodexImSystemNote(normalizeIdentifier(payload?.message));
+      const text = normalizeIdentifier(payload?.message);
       if (!text) {
         return null;
       }
@@ -1061,20 +944,6 @@ function extractTimelineEntry(record, currentTurnId, threadId) {
   }
 
   return null;
-}
-
-function stripCodexImSystemNote(text) {
-  const normalizedText = normalizeIdentifier(text);
-  if (!normalizedText) {
-    return "";
-  }
-
-  const markerIndex = normalizedText.indexOf(CODEX_IM_SYSTEM_NOTE_PREFIX);
-  if (markerIndex < 0) {
-    return normalizedText;
-  }
-
-  return normalizedText.slice(0, markerIndex).trim();
 }
 
 function extractSessionMessageText(payload) {
@@ -1361,11 +1230,11 @@ module.exports = {
   hasDeliveredAssistantTurn,
   maybeHandleExternalTurnCompletedReview,
   parseMainThreadSessionChunk,
+  parseMainThreadSessionChunkState,
   primeSessionSyncCursor,
   rememberFeishuPromptFingerprint,
   shouldSkipTrackedBindingRead,
   shouldSkipLiveSessionSync,
   startExternalSessionSync,
-  stripCodexImSystemNote,
   syncExternalSessions,
 };

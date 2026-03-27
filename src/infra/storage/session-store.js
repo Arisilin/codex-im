@@ -368,6 +368,7 @@ class SessionStore {
       sessionPath: normalizeValue(nextState.sessionPath) || previous.sessionPath || "",
       readOffset: normalizeNonNegativeInteger(nextState.readOffset, previous.readOffset || 0),
       lastRecordKey: normalizeValue(nextState.lastRecordKey) || previous.lastRecordKey || "",
+      lastTurnId: normalizeValue(nextState.lastTurnId) || previous.lastTurnId || "",
       lastSeenThreadUpdatedAt: normalizeNonNegativeInteger(
         nextState.lastSeenThreadUpdatedAt,
         previous.lastSeenThreadUpdatedAt || 0
@@ -759,6 +760,7 @@ function normalizeSessionSyncState(raw) {
     sessionPath: normalizeValue(raw.sessionPath),
     readOffset: normalizeNonNegativeInteger(raw.readOffset, 0),
     lastRecordKey: normalizeValue(raw.lastRecordKey),
+    lastTurnId: normalizeValue(raw.lastTurnId),
     lastSeenThreadUpdatedAt: normalizeNonNegativeInteger(raw.lastSeenThreadUpdatedAt, 0),
     updatedAt: normalizeValue(raw.updatedAt),
   };

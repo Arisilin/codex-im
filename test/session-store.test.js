@@ -59,6 +59,7 @@ test("SessionStore persists delivery context, session sync state, and summary ca
       sessionPath: "/tmp/thread-1.jsonl",
       readOffset: 128,
       lastRecordKey: "record-1",
+      lastTurnId: "turn-1",
       lastSeenThreadUpdatedAt: 42,
     });
     store.setSummaryCardStateForWorkspace("binding-1", "/repo", {
@@ -83,6 +84,7 @@ test("SessionStore persists delivery context, session sync state, and summary ca
       sessionPath: "/tmp/thread-1.jsonl",
       readOffset: 128,
       lastRecordKey: "record-1",
+      lastTurnId: "turn-1",
       lastSeenThreadUpdatedAt: 42,
       updatedAt: reloaded.getSessionSyncStateForWorkspace("binding-1", "/repo").updatedAt,
     });
