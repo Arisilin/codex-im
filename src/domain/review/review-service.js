@@ -121,15 +121,8 @@ async function handleLongCommand(runtime, normalized) {
     autoSelectThread: true,
   });
 
-  runtime.setPendingBindingContext(bindingKey, promptNormalized);
-  if (threadId) {
-    runtime.setPendingThreadContext(threadId, promptNormalized);
-  }
-
-  await runtime.addPendingReaction(bindingKey, normalized.messageId);
-
   try {
-    const resolvedThreadId = await runtime.ensureThreadAndSendMessage({
+    await runtime.enqueueOrDispatchThreadMessage({
       bindingKey,
       workspaceRoot,
       normalized: promptNormalized,
@@ -137,15 +130,16 @@ async function handleLongCommand(runtime, normalized) {
       reviewSendOptions: {
         enableLongModeForMainThread: true,
       },
+      failureTextPrefix: "处理 long 模式请求失败",
     });
-    runtime.movePendingReactionToThread(bindingKey, resolvedThreadId);
   } catch (error) {
-    await runtime.clearPendingReactionForBinding(bindingKey);
-    await runtime.sendInfoCardMessage({
-      chatId: normalized.chatId,
-      replyToMessageId: normalized.messageId,
-      text: formatFailureText("处理 long 模式请求失败", error),
-    });
+    if (!error?.queueDeliveryHandled) {
+      await runtime.sendInfoCardMessage({
+        chatId: normalized.chatId,
+        replyToMessageId: normalized.messageId,
+        text: formatFailureText("处理 long 模式请求失败", error),
+      });
+    }
     throw error;
   }
 }

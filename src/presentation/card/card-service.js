@@ -432,6 +432,25 @@ async function addPendingReaction(runtime, bindingKey, messageId) {
   });
 }
 
+async function addPendingReactionForMessage(runtime, messageId) {
+  const normalizedMessageId = normalizeReplyMessageId(messageId);
+  if (!normalizedMessageId) {
+    return null;
+  }
+
+  await clearPendingReactionForMessage(runtime, normalizedMessageId);
+  const reaction = await createReaction(runtime, {
+    messageId: normalizedMessageId,
+    emojiType: "Typing",
+  });
+  const pending = {
+    messageId: normalizedMessageId,
+    reactionId: reaction.reactionId,
+  };
+  runtime.pendingReactionByMessageId.set(normalizedMessageId, pending);
+  return pending;
+}
+
 function movePendingReactionToThread(runtime, bindingKey, threadId) {
   if (!bindingKey || !threadId) {
     return;
@@ -451,6 +470,19 @@ async function clearPendingReactionForBinding(runtime, bindingKey) {
     return;
   }
   runtime.pendingReactionByBindingKey.delete(bindingKey);
+  await deleteReaction(runtime, pending);
+}
+
+async function clearPendingReactionForMessage(runtime, messageId) {
+  const normalizedMessageId = normalizeReplyMessageId(messageId);
+  if (!normalizedMessageId) {
+    return;
+  }
+  const pending = runtime.pendingReactionByMessageId.get(normalizedMessageId);
+  if (!pending) {
+    return;
+  }
+  runtime.pendingReactionByMessageId.delete(normalizedMessageId);
   await deleteReaction(runtime, pending);
 }
 
@@ -792,7 +824,9 @@ function formatReplyDetailSnapshots(detailSnapshots) {
 
 module.exports = {
   addPendingReaction,
+  addPendingReactionForMessage,
   clearPendingReactionForBinding,
+  clearPendingReactionForMessage,
   clearPendingReactionForThread,
   disposeReplyRunState,
   handleCardAction,

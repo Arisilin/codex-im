@@ -25,7 +25,9 @@ const {
 } = require("../presentation/card/builders");
 const {
   addPendingReaction,
+  addPendingReactionForMessage,
   clearPendingReactionForBinding,
+  clearPendingReactionForMessage,
   clearPendingReactionForThread,
   disposeReplyRunState,
   handleCardAction,
@@ -54,6 +56,7 @@ const gpuRuntime = require("../domain/gpu/gpu-service");
 const reviewRuntime = require("../domain/review/review-service");
 const subagentRuntime = require("../domain/subagent/subagent-service");
 const runtimeState = require("../domain/session/binding-context");
+const sendQueueRuntime = require("../domain/thread/send-queue-service");
 const threadRuntime = require("../domain/thread/thread-service");
 const workspaceRuntime = require("../domain/workspace/workspace-service");
 const eventsRuntime = require("./codex-event-service");
@@ -85,10 +88,13 @@ class FeishuBotRuntime {
     this.replyFlushTimersByRunKey = new Map();
     this.pendingReactionByBindingKey = new Map();
     this.pendingReactionByThreadId = new Map();
+    this.pendingReactionByMessageId = new Map();
     this.bindingKeyByThreadId = new Map();
     this.workspaceRootByThreadId = new Map();
     this.threadSessionPathByThreadId = new Map();
     this.turnDeliveryModeByThreadId = new Map();
+    this.queuedSendItemsByThreadId = new Map();
+    this.activeSendStateByThreadId = new Map();
     this.recentFeishuPromptFingerprintsByThreadId = new Map();
     this.recentLiveDeliveredTurnAtByRunKey = new Map();
     this.externalSyncPartialChunkByThreadId = new Map();
@@ -390,9 +396,18 @@ function attachRuntimeForwarders() {
     upsertAssistantReplyCard,
     linkReplyDetailAlias,
     addPendingReaction,
+    addPendingReactionForMessage,
     movePendingReactionToThread,
     clearPendingReactionForBinding,
+    clearPendingReactionForMessage,
     clearPendingReactionForThread,
+    enqueueOrDispatchThreadMessage: sendQueueRuntime.enqueueOrDispatchThreadMessage,
+    handleQueuedTurnLifecycleEvent: sendQueueRuntime.handleQueuedTurnLifecycleEvent,
+    finalizeQueuedSendForThread: sendQueueRuntime.finalizeQueuedSendForThread,
+    clearQueuedSendItemsForThread: sendQueueRuntime.clearQueuedSendItemsForThread,
+    getQueuedSendCountForThread: sendQueueRuntime.getQueuedSendCountForThread,
+    getActiveSendStateForThread: sendQueueRuntime.getActiveSendStateForThread,
+    isThreadSendBusy: sendQueueRuntime.isThreadSendBusy,
     disposeReplyRunState,
     cleanupThreadRuntimeState: runtimeState.cleanupThreadRuntimeState,
     pruneRuntimeMapSizes: runtimeState.pruneRuntimeMapSizes,

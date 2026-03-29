@@ -6,9 +6,16 @@ async function handleStopCommand(runtime, normalized) {
   const bindingKey = runtime.sessionStore.buildBindingKey(normalized);
   const workspaceRoot = runtime.resolveWorkspaceRootForBinding(bindingKey);
   const threadId = workspaceRoot ? runtime.resolveThreadIdForBinding(bindingKey, workspaceRoot) : null;
+  const activeSendState = threadId && typeof runtime.getActiveSendStateForThread === "function"
+    ? runtime.getActiveSendStateForThread(threadId)
+    : null;
   const turnId = threadId ? runtime.activeTurnIdByThreadId.get(threadId) || null : null;
+  const queuedCount = threadId && typeof runtime.getQueuedSendCountForThread === "function"
+    ? runtime.getQueuedSendCountForThread(threadId)
+    : 0;
+  const hasActiveTurn = !!activeSendState || !!turnId;
 
-  if (!threadId) {
+  if (!threadId || (!hasActiveTurn && queuedCount === 0)) {
     await runtime.sendInfoCardMessage({
       chatId: normalized.chatId,
       replyToMessageId: normalized.messageId,
@@ -17,15 +24,34 @@ async function handleStopCommand(runtime, normalized) {
     return;
   }
 
+  if (!hasActiveTurn && queuedCount > 0) {
+    if (typeof runtime.clearQueuedSendItemsForThread === "function") {
+      await runtime.clearQueuedSendItemsForThread(threadId);
+    }
+    await runtime.sendInfoCardMessage({
+      chatId: normalized.chatId,
+      replyToMessageId: normalized.messageId,
+      text: `已清空 ${queuedCount} 条排队消息。`,
+    });
+    return;
+  }
+
+  const clearedQueuedCount = (
+    threadId && typeof runtime.clearQueuedSendItemsForThread === "function"
+      ? await runtime.clearQueuedSendItemsForThread(threadId)
+      : 0
+  );
   try {
-    await runtime.codex.sendRequest("turn/cancel", {
+    await runtime.codex.sendRequest("turn/interrupt", {
       threadId,
       turnId,
     });
     await runtime.sendInfoCardMessage({
       chatId: normalized.chatId,
       replyToMessageId: normalized.messageId,
-      text: "已发送停止请求。",
+      text: clearedQueuedCount > 0
+        ? `已发送停止请求，并清空 ${clearedQueuedCount} 条排队消息。`
+        : "已发送停止请求。",
     });
   } catch (error) {
     await runtime.sendInfoCardMessage({
@@ -43,6 +69,7 @@ function handleCodexMessage(runtime, message) {
   codexMessageUtils.trackRunningTurn(runtime.activeTurnIdByThreadId, message);
   codexMessageUtils.trackPendingApproval(runtime.pendingApprovalByThreadId, message);
   codexMessageUtils.trackRunKeyState(runtime.currentRunKeyByThreadId, runtime.activeTurnIdByThreadId, message);
+  runtime.handleQueuedTurnLifecycleEvent?.(message);
   runtime.handleReviewLifecycleEvent(message);
   subagentRuntime.handleCodexLifecycleEvent(runtime, message);
   runtime.pruneRuntimeMapSizes();
@@ -82,12 +109,13 @@ function handleCodexMessage(runtime, message) {
   if (shouldUseSessionBackedDelivery) {
     handleSessionBackedCodexEvent(runtime, outbound).catch((error) => {
       console.error(`[codex-im] failed to process session-backed event: ${error.message}`);
-    }).finally(() => {
+    }).finally(async () => {
       if (!shouldCleanupThreadState || !threadId) {
         return;
       }
       runtime.turnDeliveryModeByThreadId.delete(threadId);
       runtime.cleanupThreadRuntimeState(threadId);
+      await runtime.finalizeQueuedSendForThread?.(threadId);
     });
     return;
   }
@@ -222,6 +250,7 @@ async function finalizeLiveTurn(runtime, threadId) {
     console.error(`[codex-im] failed to clear pending reaction: ${error.message}`);
   });
   runtime.cleanupThreadRuntimeState(threadId);
+  await runtime.finalizeQueuedSendForThread?.(threadId);
 }
 
 function isTerminalTurnMessage(message) {

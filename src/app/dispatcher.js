@@ -27,28 +27,22 @@ async function onFeishuTextEvent(runtime, event) {
     autoSelectThread: true,
   });
 
-  runtime.setPendingBindingContext(bindingKey, normalized);
-  if (threadId) {
-    runtime.setPendingThreadContext(threadId, normalized);
-  }
-
-  await runtime.addPendingReaction(bindingKey, normalized.messageId);
-
   try {
-    const resolvedThreadId = await runtime.ensureThreadAndSendMessage({
+    await runtime.enqueueOrDispatchThreadMessage({
       bindingKey,
       workspaceRoot,
       normalized,
       threadId,
+      failureTextPrefix: "处理失败",
     });
-    runtime.movePendingReactionToThread(bindingKey, resolvedThreadId);
   } catch (error) {
-    await runtime.clearPendingReactionForBinding(bindingKey);
-    await runtime.sendInfoCardMessage({
-      chatId: normalized.chatId,
-      replyToMessageId: normalized.messageId,
-      text: formatFailureText("处理失败", error),
-    });
+    if (!error?.queueDeliveryHandled) {
+      await runtime.sendInfoCardMessage({
+        chatId: normalized.chatId,
+        replyToMessageId: normalized.messageId,
+        text: formatFailureText("处理失败", error),
+      });
+    }
     throw error;
   }
 }
