@@ -1,13 +1,21 @@
 const codexMessageUtils = require("../infra/codex/message-utils");
 const { formatFailureText } = require("../shared/error-text");
+const subagentRuntime = require("../domain/subagent/subagent-service");
 
 async function handleStopCommand(runtime, normalized) {
   const bindingKey = runtime.sessionStore.buildBindingKey(normalized);
   const workspaceRoot = runtime.resolveWorkspaceRootForBinding(bindingKey);
   const threadId = workspaceRoot ? runtime.resolveThreadIdForBinding(bindingKey, workspaceRoot) : null;
+  const activeSendState = threadId && typeof runtime.getActiveSendStateForThread === "function"
+    ? runtime.getActiveSendStateForThread(threadId)
+    : null;
   const turnId = threadId ? runtime.activeTurnIdByThreadId.get(threadId) || null : null;
+  const queuedCount = threadId && typeof runtime.getQueuedSendCountForThread === "function"
+    ? runtime.getQueuedSendCountForThread(threadId)
+    : 0;
+  const hasActiveTurn = !!activeSendState || !!turnId;
 
-  if (!threadId) {
+  if (!threadId || (!hasActiveTurn && queuedCount === 0)) {
     await runtime.sendInfoCardMessage({
       chatId: normalized.chatId,
       replyToMessageId: normalized.messageId,
@@ -16,15 +24,34 @@ async function handleStopCommand(runtime, normalized) {
     return;
   }
 
+  if (!hasActiveTurn && queuedCount > 0) {
+    if (typeof runtime.clearQueuedSendItemsForThread === "function") {
+      await runtime.clearQueuedSendItemsForThread(threadId);
+    }
+    await runtime.sendInfoCardMessage({
+      chatId: normalized.chatId,
+      replyToMessageId: normalized.messageId,
+      text: `已清空 ${queuedCount} 条排队消息。`,
+    });
+    return;
+  }
+
+  const clearedQueuedCount = (
+    threadId && typeof runtime.clearQueuedSendItemsForThread === "function"
+      ? await runtime.clearQueuedSendItemsForThread(threadId)
+      : 0
+  );
   try {
-    await runtime.codex.sendRequest("turn/cancel", {
+    await runtime.codex.sendRequest("turn/interrupt", {
       threadId,
       turnId,
     });
     await runtime.sendInfoCardMessage({
       chatId: normalized.chatId,
       replyToMessageId: normalized.messageId,
-      text: "已发送停止请求。",
+      text: clearedQueuedCount > 0
+        ? `已发送停止请求，并清空 ${clearedQueuedCount} 条排队消息。`
+        : "已发送停止请求。",
     });
   } catch (error) {
     await runtime.sendInfoCardMessage({
@@ -42,7 +69,16 @@ function handleCodexMessage(runtime, message) {
   codexMessageUtils.trackRunningTurn(runtime.activeTurnIdByThreadId, message);
   codexMessageUtils.trackPendingApproval(runtime.pendingApprovalByThreadId, message);
   codexMessageUtils.trackRunKeyState(runtime.currentRunKeyByThreadId, runtime.activeTurnIdByThreadId, message);
+  runtime.handleQueuedTurnLifecycleEvent?.(message);
+  runtime.handleReviewLifecycleEvent(message);
+  subagentRuntime.handleCodexLifecycleEvent(runtime, message);
   runtime.pruneRuntimeMapSizes();
+  if (runtime.shouldSuppressReviewThreadDelivery(message)) {
+    runtime.handleReviewSuppressedMessage(message).catch((error) => {
+      console.error(`[codex-im] failed to process suppressed review message: ${error.message}`);
+    });
+    return;
+  }
   const outbound = codexMessageUtils.mapCodexMessageToImEvent(message);
   if (!outbound) {
     return;
@@ -58,6 +94,11 @@ function handleCodexMessage(runtime, message) {
     outbound.payload.threadKey = context.threadKey;
   }
 
+  const deliveryMode = runtime.turnDeliveryModeByThreadId.get(threadId) || "";
+  const shouldUseSessionBackedDelivery = (
+    deliveryMode === "session"
+    && (outbound.type === "im.agent_reply" || outbound.type === "im.run_state")
+  );
   if (codexMessageUtils.eventShouldClearPendingReaction(outbound)) {
     runtime.clearPendingReactionForThread(threadId).catch((error) => {
       console.error(`[codex-im] failed to clear pending reaction: ${error.message}`);
@@ -65,6 +106,20 @@ function handleCodexMessage(runtime, message) {
   }
 
   const shouldCleanupThreadState = isTerminalTurnMessage(message);
+  if (shouldUseSessionBackedDelivery) {
+    handleSessionBackedCodexEvent(runtime, outbound).catch((error) => {
+      console.error(`[codex-im] failed to process session-backed event: ${error.message}`);
+    }).finally(async () => {
+      if (!shouldCleanupThreadState || !threadId) {
+        return;
+      }
+      runtime.turnDeliveryModeByThreadId.delete(threadId);
+      runtime.cleanupThreadRuntimeState(threadId);
+      await runtime.finalizeQueuedSendForThread?.(threadId);
+    });
+    return;
+  }
+
   runtime.deliverToFeishu(outbound)
     .catch((error) => {
       console.error(`[codex-im] failed to deliver Feishu message: ${error.message}`);
@@ -73,10 +128,9 @@ function handleCodexMessage(runtime, message) {
       if (!shouldCleanupThreadState || !threadId) {
         return;
       }
-      runtime.clearPendingReactionForThread(threadId).catch((error) => {
-        console.error(`[codex-im] failed to clear pending reaction: ${error.message}`);
+      finalizeLiveTurn(runtime, threadId).catch((error) => {
+        console.error(`[codex-im] failed to finalize live turn: ${error.message}`);
       });
-      runtime.cleanupThreadRuntimeState(threadId);
     });
 }
 
@@ -85,8 +139,10 @@ async function deliverToFeishu(runtime, event) {
     await runtime.upsertAssistantReplyCard({
       threadId: event.payload.threadId,
       turnId: event.payload.turnId,
+      itemId: event.payload.itemId || "",
       chatId: event.payload.chatId,
       text: event.payload.text,
+      textMode: event.payload.textMode || "replace",
       state: "streaming",
       deferFlush: !runtime.config.feishuStreamingOutput,
     });
@@ -111,14 +167,21 @@ async function deliverToFeishu(runtime, event) {
         chatId: event.payload.chatId,
         state: "completed",
       });
+      rememberRecentLiveDeliveredTurn(runtime, event.payload);
+      await runtime.handleMainTurnCompleted({
+        threadId: event.payload.threadId,
+        turnId: event.payload.turnId,
+      });
     } else if (event.payload.state === "failed") {
       await runtime.upsertAssistantReplyCard({
         threadId: event.payload.threadId,
         turnId: event.payload.turnId,
         chatId: event.payload.chatId,
         text: event.payload.text || "执行失败",
+        textMode: "append",
         state: "failed",
       });
+      rememberRecentLiveDeliveredTurn(runtime, event.payload);
     }
     return;
   }
@@ -146,9 +209,81 @@ async function deliverToFeishu(runtime, event) {
   }
 }
 
+async function handleSessionBackedCodexEvent(runtime, event) {
+  if (event.type !== "im.run_state") {
+    return;
+  }
+
+  if (event.payload.state === "completed") {
+    await finalizeSessionBackedAssistantCard(runtime, event.payload);
+    await runtime.handleMainTurnCompleted({
+      threadId: event.payload.threadId,
+      turnId: event.payload.turnId,
+    });
+  }
+}
+
+async function finalizeSessionBackedAssistantCard(runtime, payload) {
+  if (!payload?.threadId || !payload?.chatId) {
+    return;
+  }
+
+  try {
+    await runtime.upsertAssistantReplyCard({
+      threadId: payload.threadId,
+      turnId: payload.turnId,
+      chatId: payload.chatId,
+      state: "completed",
+    });
+  } catch (error) {
+    console.error(`[codex-im] failed to finalize session-backed reply card: ${error.message}`);
+  }
+}
+
+async function finalizeLiveTurn(runtime, threadId) {
+  if (!threadId) {
+    return;
+  }
+  await runtime.advanceSessionSyncCursorToEof({ threadId });
+  runtime.turnDeliveryModeByThreadId.delete(threadId);
+  runtime.clearPendingReactionForThread(threadId).catch((error) => {
+    console.error(`[codex-im] failed to clear pending reaction: ${error.message}`);
+  });
+  runtime.cleanupThreadRuntimeState(threadId);
+  await runtime.finalizeQueuedSendForThread?.(threadId);
+}
+
 function isTerminalTurnMessage(message) {
   const method = typeof message?.method === "string" ? message.method : "";
   return method === "turn/completed" || method === "turn/failed" || method === "turn/cancelled";
+}
+
+function rememberRecentLiveDeliveredTurn(runtime, payload) {
+  const threadId = typeof payload?.threadId === "string" ? payload.threadId.trim() : "";
+  const turnId = typeof payload?.turnId === "string" ? payload.turnId.trim() : "";
+  if (!threadId || !turnId || !(runtime.recentLiveDeliveredTurnAtByRunKey instanceof Map)) {
+    return;
+  }
+
+  pruneRecentLiveDeliveredTurns(runtime);
+  runtime.recentLiveDeliveredTurnAtByRunKey.set(
+    codexMessageUtils.buildRunKey(threadId, turnId),
+    Date.now()
+  );
+}
+
+function pruneRecentLiveDeliveredTurns(runtime) {
+  const entries = runtime.recentLiveDeliveredTurnAtByRunKey;
+  if (!(entries instanceof Map) || entries.size === 0) {
+    return;
+  }
+
+  const threshold = Date.now() - (5 * 60 * 1000);
+  for (const [runKey, deliveredAtMs] of entries.entries()) {
+    if (typeof deliveredAtMs !== "number" || deliveredAtMs < threshold) {
+      entries.delete(runKey);
+    }
+  }
 }
 
 module.exports = {
