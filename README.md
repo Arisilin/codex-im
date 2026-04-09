@@ -30,16 +30,18 @@ Codex 操作都留在 本地，飞书只负责消息交互。
 
 ## 安装
 
-npm安装和执行：
+发布版安装：
 
 ```sh
 npm install -g @arisilin/codex-im
 codex-im feishu-bot
 ```
 
-开发态运行：
+源码运行：
 
 ```sh
+git clone git@github.com:Arisilin/codex-im.git
+cd codex-im
 npm install
 npm run feishu-bot
 ```
@@ -92,6 +94,14 @@ codex-im feishu-bot
 
 
 ## 使用
+
+全局安装后：
+
+```sh
+codex-im feishu-bot
+```
+
+源码运行时：
 
 ```sh
 npm run feishu-bot

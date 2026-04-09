@@ -31,7 +31,7 @@
     "node": ">=18"
   },
   "bin": {
-    "codex-im": "./bin/codex-im.js"
+    "codex-im": "bin/codex-im.js"
   },
   "publishConfig": {
     "access": "public"
