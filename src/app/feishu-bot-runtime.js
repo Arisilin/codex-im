@@ -32,6 +32,7 @@ const {
   sendInfoCardMessage,
   sendInteractiveApprovalCard,
   sendInteractiveCard,
+  sealCurrentReplyCard,
   updateInteractiveCard,
   upsertAssistantReplyCard,
 } = require("../presentation/card/card-service");
@@ -67,9 +68,15 @@ class FeishuBotRuntime {
     this.pendingChatContextByBindingKey = new Map();
     this.activeTurnIdByThreadId = new Map();
     this.pendingApprovalByThreadId = new Map();
+    this.activeItemByThreadId = new Map();
     this.replyCardByRunKey = new Map();
     this.currentRunKeyByThreadId = new Map();
+    this.currentReplyCardKeyByThreadId = new Map();
     this.replyFlushTimersByRunKey = new Map();
+    this.replyFlushLocksByRunKey = new Map();
+    this.queuedMessagesByThreadId = new Map();
+    this.interruptRequestedByThreadId = new Set();
+    this.queuedDispatchInFlightByThreadId = new Set();
     this.pendingReactionByBindingKey = new Map();
     this.pendingReactionByThreadId = new Map();
     this.bindingKeyByThreadId = new Map();
@@ -244,6 +251,11 @@ function attachRuntimeForwarders() {
     resolveWorkspaceThreadState: threadRuntime.resolveWorkspaceThreadState,
     ensureThreadAndSendMessage: threadRuntime.ensureThreadAndSendMessage,
     ensureThreadResumed: threadRuntime.ensureThreadResumed,
+    isThreadBusy: threadRuntime.isThreadBusy,
+    enqueueThreadMessage: threadRuntime.enqueueThreadMessage,
+    hasQueuedThreadMessages: threadRuntime.hasQueuedThreadMessages,
+    requestQueuedTurnInterrupt: threadRuntime.requestQueuedTurnInterrupt,
+    dispatchQueuedThreadMessage: threadRuntime.dispatchQueuedThreadMessage,
     resolveWorkspaceRootForBinding: runtimeState.resolveWorkspaceRootForBinding,
     resolveThreadIdForBinding: runtimeState.resolveThreadIdForBinding,
     setThreadBindingKey: runtimeState.setThreadBindingKey,
@@ -282,6 +294,7 @@ function attachRuntimeForwarders() {
     updateInteractiveCard,
     sendInteractiveCard,
     patchInteractiveCard,
+    sealCurrentReplyCard,
     handleCardAction,
     dispatchCardAction: runtimeCommands.dispatchCardAction,
     handlePanelCardAction: runtimeCommands.handlePanelCardAction,

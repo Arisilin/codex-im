@@ -29,6 +29,7 @@ function mapCodexMessageToImEvent(message) {
   const params = message?.params || {};
   const threadId = extractThreadIdentifier(params);
   const turnId = extractTurnIdentifier(params);
+  const itemId = extractItemIdentifier(params);
 
   if (isAssistantMessageMethod(method, params)) {
     const text = extractAssistantText(method, params);
@@ -40,7 +41,9 @@ function mapCodexMessageToImEvent(message) {
       payload: {
         threadId,
         turnId,
+        itemId,
         text,
+        textMode: method === "item/completed" ? "replace" : "append",
       },
     };
   }
@@ -158,6 +161,7 @@ function trackRunKeyState(currentRunKeyByThreadId, activeTurnIdByThreadId, messa
   const params = message?.params || {};
   const threadId = extractTrackThreadId(params);
   const turnId = extractTrackTurnId(params) || activeTurnIdByThreadId.get(threadId) || "";
+  const itemId = extractItemIdentifier(params);
   if (!threadId) {
     return;
   }
@@ -167,9 +171,49 @@ function trackRunKeyState(currentRunKeyByThreadId, activeTurnIdByThreadId, messa
     return;
   }
 
+  if (isAssistantMessageMethod(method, params) && turnId && itemId) {
+    currentRunKeyByThreadId.set(threadId, buildRunKey(threadId, turnId, itemId));
+    return;
+  }
+
   if (method === "turn/completed" || method === "turn/failed" || method === "turn/cancelled") {
+    const currentRunKey = currentRunKeyByThreadId.get(threadId) || "";
+    const currentTurnId = extractTurnIdFromRunKey(currentRunKey);
+    if (currentRunKey && (!turnId || currentTurnId === turnId)) {
+      return;
+    }
     if (turnId) {
       currentRunKeyByThreadId.set(threadId, buildRunKey(threadId, turnId));
+    }
+  }
+}
+
+function trackActiveItemState(activeItemByThreadId, message) {
+  const lifecycle = extractItemLifecycle(message);
+  const method = message?.method;
+
+  if (lifecycle?.threadId) {
+    if (lifecycle.phase === "started" && lifecycle.itemId) {
+      activeItemByThreadId.set(lifecycle.threadId, {
+        itemId: lifecycle.itemId,
+        itemType: lifecycle.itemType,
+      });
+      return;
+    }
+
+    if (lifecycle.phase === "completed") {
+      const active = activeItemByThreadId.get(lifecycle.threadId);
+      if (!active || !lifecycle.itemId || active.itemId === lifecycle.itemId) {
+        activeItemByThreadId.delete(lifecycle.threadId);
+      }
+      return;
+    }
+  }
+
+  if (method === "turn/completed" || method === "turn/failed" || method === "turn/cancelled") {
+    const threadId = extractTrackThreadId(message?.params || {});
+    if (threadId) {
+      activeItemByThreadId.delete(threadId);
     }
   }
 }
@@ -182,19 +226,46 @@ function buildApprovalResponsePayload(decision) {
   return { decision };
 }
 
-function buildRunKey(threadId, turnId) {
-  return `${threadId}:${turnId || "pending"}`;
+function buildRunKey(threadId, turnId, itemId = "") {
+  return `${threadId}:${turnId || "pending"}:${itemId || "pending"}`;
 }
 
 function extractTurnIdFromRunKey(runKey) {
-  if (!runKey || !runKey.includes(":")) {
+  if (!runKey) {
     return "";
   }
-  return runKey.slice(runKey.indexOf(":") + 1);
+  const segments = String(runKey).split(":");
+  return segments.length >= 2 ? segments[1] : "";
+}
+
+function extractItemIdFromRunKey(runKey) {
+  if (!runKey) {
+    return "";
+  }
+  const segments = String(runKey).split(":");
+  return segments.length >= 3 ? segments[2] : "";
 }
 
 function extractCreatedMessageId(response) {
   return response?.data?.message_id || "";
+}
+
+function extractItemLifecycle(message) {
+  const method = message?.method;
+  if (method !== "item/started" && method !== "item/completed") {
+    return null;
+  }
+
+  const params = message?.params || {};
+  return {
+    phase: method === "item/completed" ? "completed" : "started",
+    threadId: extractThreadIdentifier(params),
+    turnId: extractTurnIdentifier(params),
+    itemId: extractItemIdentifier(params),
+    itemType: typeof params?.item?.type === "string"
+      ? params.item.type.trim().toLowerCase()
+      : "",
+  };
 }
 
 function extractThreadsFromListResponse(response) {
@@ -528,6 +599,10 @@ function extractTurnIdentifier(params) {
   return normalizeIdentifier(params?.turnId || params?.turn?.id);
 }
 
+function extractItemIdentifier(params) {
+  return normalizeIdentifier(params?.itemId || params?.item?.id);
+}
+
 function normalizeIdentifier(value) {
   return typeof value === "string" && value.trim() ? value.trim() : "";
 }
@@ -576,16 +651,19 @@ module.exports = {
   buildRunKey,
   eventShouldClearPendingReaction,
   extractCreatedMessageId,
+  extractItemLifecycle,
   extractThreadId,
   extractThreadListCursor,
   extractThreadsFromListResponse,
   extractTurnIdFromRunKey,
   extractRecentConversationFromResumeResponse,
+  extractItemIdFromRunKey,
   isCommandApprovalMethod,
   isWorkspaceApprovalCommand,
   mapCodexMessageToImEvent,
   matchesCommandPrefix,
   normalizeCommandTokens,
+  trackActiveItemState,
   trackPendingApproval,
   trackRunKeyState,
   trackRunningTurn,

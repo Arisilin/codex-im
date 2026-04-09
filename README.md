@@ -33,7 +33,7 @@ Codex 操作都留在 本地，飞书只负责消息交互。
 npm安装和执行：
 
 ```sh
-npm install -g @vdug/codex-im
+npm install -g @arisilin/codex-im
 codex-im feishu-bot
 ```
 
@@ -49,7 +49,7 @@ npm run feishu-bot
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
-npm install -g @vdug/codex-im
+npm install -g @arisilin/codex-im
 codex-im feishu-bot
 ```
 

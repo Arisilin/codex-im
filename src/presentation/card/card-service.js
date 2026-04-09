@@ -145,70 +145,163 @@ async function sendCardActionFeedback(runtime, data, text, kind = "info") {
 
 async function upsertAssistantReplyCard(
   runtime,
-  { threadId, turnId, chatId, text, state, deferFlush = false }
+  { threadId, turnId, itemId, chatId, text, textMode = "append", state, deferFlush = false }
 ) {
   if (!threadId || !chatId) {
     return;
   }
 
-  const resolvedTurnId = turnId
-    || runtime.activeTurnIdByThreadId.get(threadId)
-    || codexMessageUtils.extractTurnIdFromRunKey(runtime.currentRunKeyByThreadId.get(threadId) || "")
-    || "";
-  const preferredRunKey = codexMessageUtils.buildRunKey(threadId, resolvedTurnId);
-  let runKey = preferredRunKey;
-  let existing = runtime.replyCardByRunKey.get(runKey) || null;
-
-  if (!existing) {
-    const currentRunKey = runtime.currentRunKeyByThreadId.get(threadId) || "";
-    const currentEntry = runtime.replyCardByRunKey.get(currentRunKey) || null;
-    const shouldReuseCurrent = !!(
-      currentEntry
-      && currentEntry.state !== "completed"
-      && currentEntry.state !== "failed"
-      && (!resolvedTurnId || !currentEntry.turnId || currentEntry.turnId === resolvedTurnId)
-    );
-    if (shouldReuseCurrent) {
-      runKey = currentRunKey;
-      existing = currentEntry;
-    }
-  }
-
-  if (!existing) {
-    existing = {
-      messageId: "",
-      chatId,
-      replyToMessageId: "",
-      text: "",
-      state: "streaming",
-      threadId,
-      turnId: resolvedTurnId,
-    };
-  }
+  const { cardKey, entry } = resolveReplyCardEntry(runtime, {
+    threadId,
+    turnId,
+    chatId,
+  });
 
   if (typeof text === "string" && text.length > 0) {
-    existing.text = mergeReplyText(existing.text, text);
+    applyAssistantTextUpdate(entry, {
+      itemId,
+      text,
+      textMode,
+    });
   }
-  existing.chatId = chatId;
-  existing.replyToMessageId = runtime.pendingChatContextByThreadId.get(threadId)?.messageId || existing.replyToMessageId || "";
+
+  entry.chatId = chatId;
+  entry.replyToMessageId = runtime.pendingChatContextByThreadId.get(threadId)?.messageId || entry.replyToMessageId || "";
   if (state) {
-    existing.state = state;
+    entry.state = state;
   }
-  if (resolvedTurnId) {
-    existing.turnId = resolvedTurnId;
+  if (turnId) {
+    entry.turnId = turnId;
   }
 
-  runtime.setReplyCardEntry(runKey, existing);
-  runtime.setCurrentRunKeyForThread(threadId, runKey);
+  runtime.setReplyCardEntry(cardKey, entry);
+  runtime.currentReplyCardKeyByThreadId.set(threadId, cardKey);
 
-  if (deferFlush && existing.state !== "completed" && existing.state !== "failed") {
+  if (deferFlush && entry.state !== "completed" && entry.state !== "failed") {
     return;
   }
 
-  const shouldFlushImmediately = existing.state === "completed"
-    || existing.state === "failed"
-    || (!existing.messageId && typeof existing.text === "string" && existing.text.trim());
-  await scheduleReplyCardFlush(runtime, runKey, { immediate: shouldFlushImmediately });
+  const shouldFlushImmediately = entry.state === "completed"
+    || entry.state === "failed"
+    || textMode === "replace"
+    || (!entry.messageId && buildReplyCardText(entry));
+  await scheduleReplyCardFlush(runtime, cardKey, { immediate: shouldFlushImmediately });
+}
+
+function resolveReplyCardEntry(runtime, { threadId, turnId, chatId }) {
+  const currentCardKey = runtime.currentReplyCardKeyByThreadId.get(threadId) || "";
+  const currentEntry = currentCardKey ? runtime.replyCardByRunKey.get(currentCardKey) || null : null;
+  if (currentEntry && !currentEntry.sealed) {
+    if (turnId && !currentEntry.turnId) {
+      currentEntry.turnId = turnId;
+    }
+    currentEntry.chatId = chatId || currentEntry.chatId || "";
+    return { cardKey: currentCardKey, entry: currentEntry };
+  }
+
+  const pendingContext = runtime.pendingChatContextByThreadId.get(threadId) || null;
+  const replyToMessageId = pendingContext?.messageId || "";
+  const baseKey = `${threadId}:${replyToMessageId || "pending"}`;
+  let cardKey = baseKey;
+  let suffix = 1;
+  while (runtime.replyCardByRunKey.has(cardKey) && runtime.replyCardByRunKey.get(cardKey)?.sealed) {
+    suffix += 1;
+    cardKey = `${baseKey}:${suffix}`;
+  }
+
+  const entry = runtime.replyCardByRunKey.get(cardKey) || {
+    messageId: "",
+    chatId,
+    replyToMessageId,
+    state: "streaming",
+    threadId,
+    turnId: turnId || "",
+    completedItems: [],
+    activeItemId: "",
+    activeText: "",
+    sealed: false,
+  };
+  entry.chatId = chatId || entry.chatId || "";
+  entry.replyToMessageId = replyToMessageId || entry.replyToMessageId || "";
+  entry.sealed = false;
+  return { cardKey, entry };
+}
+
+function applyAssistantTextUpdate(entry, { itemId, text, textMode }) {
+  const resolvedItemId = typeof itemId === "string" && itemId.trim() ? itemId.trim() : entry.activeItemId || "active";
+  if (!resolvedItemId) {
+    return;
+  }
+
+  if (entry.activeItemId && entry.activeItemId !== resolvedItemId) {
+    finalizeActiveItem(entry);
+  }
+
+  if (!entry.activeItemId || entry.activeItemId !== resolvedItemId) {
+    entry.activeItemId = resolvedItemId;
+    entry.activeText = "";
+  }
+
+  if (textMode === "replace") {
+    entry.activeText = text;
+    finalizeActiveItem(entry);
+    return;
+  }
+
+  entry.activeText = mergeReplyText(entry.activeText, text);
+}
+
+function finalizeActiveItem(entry) {
+  const itemId = entry.activeItemId || "";
+  const text = String(entry.activeText || "").trim();
+  if (itemId && text) {
+    upsertCompletedItem(entry, itemId, text);
+  }
+  entry.activeItemId = "";
+  entry.activeText = "";
+}
+
+function upsertCompletedItem(entry, itemId, text) {
+  if (!itemId || !text) {
+    return;
+  }
+
+  const completedItems = Array.isArray(entry.completedItems) ? entry.completedItems : [];
+  const existingIndex = completedItems.findIndex((item) => item?.itemId === itemId);
+  if (existingIndex >= 0) {
+    completedItems[existingIndex] = { itemId, text };
+  } else {
+    completedItems.push({ itemId, text });
+  }
+  entry.completedItems = completedItems;
+}
+
+function buildReplyCardText(entry) {
+  const completed = Array.isArray(entry.completedItems)
+    ? entry.completedItems.map((item) => String(item?.text || "").trim()).filter(Boolean)
+    : [];
+  const active = String(entry.activeText || "").trim();
+  if (active) {
+    completed.push(active);
+  }
+  return completed.join("\n\n").trim();
+}
+
+function sealCurrentReplyCard(runtime, threadId) {
+  if (!threadId) {
+    return;
+  }
+  const cardKey = runtime.currentReplyCardKeyByThreadId.get(threadId) || "";
+  if (!cardKey) {
+    return;
+  }
+  const entry = runtime.replyCardByRunKey.get(cardKey);
+  if (entry) {
+    finalizeActiveItem(entry);
+    entry.sealed = true;
+    runtime.setReplyCardEntry(cardKey, entry);
+  }
+  runtime.currentReplyCardKeyByThreadId.delete(threadId);
 }
 
 async function scheduleReplyCardFlush(runtime, runKey, { immediate = false } = {}) {
@@ -219,7 +312,7 @@ async function scheduleReplyCardFlush(runtime, runKey, { immediate = false } = {
 
   if (immediate) {
     clearReplyFlushTimer(runtime, runKey);
-    await flushReplyCard(runtime, runKey);
+    await enqueueReplyCardFlush(runtime, runKey);
     return;
   }
 
@@ -229,11 +322,25 @@ async function scheduleReplyCardFlush(runtime, runKey, { immediate = false } = {
 
   const timer = setTimeout(() => {
     runtime.replyFlushTimersByRunKey.delete(runKey);
-    flushReplyCard(runtime, runKey).catch((error) => {
+    enqueueReplyCardFlush(runtime, runKey).catch((error) => {
       console.error(`[codex-im] failed to flush reply card: ${error.message}`);
     });
   }, 300);
   runtime.replyFlushTimersByRunKey.set(runKey, timer);
+}
+
+function enqueueReplyCardFlush(runtime, runKey) {
+  const previous = runtime.replyFlushLocksByRunKey.get(runKey) || Promise.resolve();
+  const next = previous
+    .catch(() => {})
+    .then(() => flushReplyCard(runtime, runKey))
+    .finally(() => {
+      if (runtime.replyFlushLocksByRunKey.get(runKey) === next) {
+        runtime.replyFlushLocksByRunKey.delete(runKey);
+      }
+    });
+  runtime.replyFlushLocksByRunKey.set(runKey, next);
+  return next;
 }
 
 function clearReplyFlushTimer(runtime, runKey) {
@@ -252,7 +359,7 @@ async function flushReplyCard(runtime, runKey) {
   }
 
   const card = buildAssistantReplyCard({
-    text: entry.text,
+    text: buildReplyCardText(entry),
     state: entry.state,
   });
 
@@ -270,9 +377,6 @@ async function flushReplyCard(runtime, runKey) {
     runtime.clearPendingReactionForThread(entry.threadId).catch((error) => {
       console.error(`[codex-im] failed to clear pending reaction after first reply card: ${error.message}`);
     });
-    if (entry.state === "completed" || entry.state === "failed") {
-      runtime.disposeReplyRunState(runKey, entry.threadId);
-    }
     return;
   }
 
@@ -280,14 +384,15 @@ async function flushReplyCard(runtime, runKey) {
     messageId: entry.messageId,
     card,
   });
-
-  if (entry.state === "completed" || entry.state === "failed") {
-    runtime.disposeReplyRunState(runKey, entry.threadId);
-  }
 }
 
 async function addPendingReaction(runtime, bindingKey, messageId) {
   if (!bindingKey || !messageId) {
+    return;
+  }
+
+  const existing = runtime.pendingReactionByBindingKey.get(bindingKey);
+  if (existing?.messageId === messageId) {
     return;
   }
 
@@ -348,7 +453,11 @@ async function deleteReaction(runtime, { messageId, reactionId }) {
 function disposeReplyRunState(runtime, runKey, threadId) {
   if (runKey) {
     clearReplyFlushTimer(runtime, runKey);
+    runtime.replyFlushLocksByRunKey.delete(runKey);
     runtime.replyCardByRunKey.delete(runKey);
+  }
+  if (threadId && runtime.currentReplyCardKeyByThreadId.get(threadId) === runKey) {
+    runtime.currentReplyCardKeyByThreadId.delete(threadId);
   }
   if (threadId && runtime.currentRunKeyByThreadId.get(threadId) === runKey) {
     runtime.currentRunKeyByThreadId.delete(threadId);
@@ -366,6 +475,7 @@ module.exports = {
   patchInteractiveCard,
   queueCardActionWithFeedback,
   runCardActionTask,
+  sealCurrentReplyCard,
   sendCardActionFeedback,
   sendCardActionFeedbackByContext,
   sendInfoCardMessage,

@@ -27,6 +27,22 @@ async function onFeishuTextEvent(runtime, event) {
     autoSelectThread: true,
   });
 
+  if (threadId && runtime.isThreadBusy(threadId)) {
+    runtime.enqueueThreadMessage({
+      threadId,
+      bindingKey,
+      workspaceRoot,
+      normalized,
+    });
+    runtime.addPendingReaction(bindingKey, normalized.messageId).catch((error) => {
+      console.error(`[codex-im] failed to add queued reaction: ${error.message}`);
+    });
+    runtime.requestQueuedTurnInterrupt(threadId).catch((error) => {
+      console.error(`[codex-im] failed to request queued interrupt: ${error.message}`);
+    });
+    return;
+  }
+
   runtime.setPendingBindingContext(bindingKey, normalized);
   if (threadId) {
     runtime.setPendingThreadContext(threadId, normalized);

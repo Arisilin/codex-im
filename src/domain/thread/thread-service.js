@@ -15,6 +15,7 @@ const THREAD_SOURCE_KINDS = new Set([
   "subAgentOther",
   "unknown",
 ]);
+const INTERRUPT_PROTECTED_ITEM_TYPES = new Set(["collabagenttoolcall"]);
 
 async function resolveWorkspaceThreadState(runtime, {
   bindingKey,
@@ -313,13 +314,133 @@ function shouldRecreateThread(error) {
   return message.includes("thread not found") || message.includes("unknown thread");
 }
 
+function isThreadBusy(runtime, threadId) {
+  if (!threadId) {
+    return false;
+  }
+  return runtime.pendingApprovalByThreadId.has(threadId) || runtime.activeTurnIdByThreadId.has(threadId);
+}
+
+function hasQueuedThreadMessages(runtime, threadId) {
+  const queue = runtime.queuedMessagesByThreadId.get(threadId);
+  return Array.isArray(queue) && queue.length > 0;
+}
+
+function enqueueThreadMessage(runtime, { threadId, bindingKey, workspaceRoot, normalized }) {
+  if (!threadId || !bindingKey || !workspaceRoot || !normalized?.messageId) {
+    return;
+  }
+
+  const queue = runtime.queuedMessagesByThreadId.get(threadId) || [];
+  queue.push({
+    threadId,
+    bindingKey,
+    workspaceRoot,
+    normalized,
+  });
+  runtime.queuedMessagesByThreadId.set(threadId, queue);
+}
+
+async function requestQueuedTurnInterrupt(runtime, threadId) {
+  if (!threadId || !hasQueuedThreadMessages(runtime, threadId) || runtime.interruptRequestedByThreadId.has(threadId)) {
+    return false;
+  }
+
+  const activeItem = runtime.activeItemByThreadId?.get(threadId) || null;
+  if (INTERRUPT_PROTECTED_ITEM_TYPES.has(String(activeItem?.itemType || "").toLowerCase())) {
+    return false;
+  }
+
+  const turnId = runtime.activeTurnIdByThreadId.get(threadId) || "";
+  if (!turnId) {
+    return false;
+  }
+
+  runtime.interruptRequestedByThreadId.add(threadId);
+  try {
+    await runtime.codex.sendRequest("turn/interrupt", {
+      threadId,
+      turnId,
+    });
+    return true;
+  } catch (error) {
+    runtime.interruptRequestedByThreadId.delete(threadId);
+    console.error(`[codex-im] queued interrupt failed thread=${threadId}: ${error.message}`);
+    return false;
+  }
+}
+
+async function dispatchQueuedThreadMessage(runtime, threadId) {
+  if (!threadId || runtime.queuedDispatchInFlightByThreadId.has(threadId)) {
+    return false;
+  }
+
+  const queue = runtime.queuedMessagesByThreadId.get(threadId);
+  if (!Array.isArray(queue) || queue.length === 0) {
+    runtime.interruptRequestedByThreadId.delete(threadId);
+    return false;
+  }
+
+  const queued = queue.shift();
+  if (queue.length) {
+    runtime.queuedMessagesByThreadId.set(threadId, queue);
+  } else {
+    runtime.queuedMessagesByThreadId.delete(threadId);
+  }
+
+  runtime.interruptRequestedByThreadId.delete(threadId);
+  runtime.queuedDispatchInFlightByThreadId.add(threadId);
+
+  const { bindingKey, workspaceRoot, normalized } = queued;
+  runtime.sealCurrentReplyCard(threadId);
+  runtime.setPendingBindingContext(bindingKey, normalized);
+  runtime.setPendingThreadContext(threadId, normalized);
+
+  try {
+    await runtime.addPendingReaction(bindingKey, normalized.messageId);
+    const resolvedThreadId = await runtime.ensureThreadAndSendMessage({
+      bindingKey,
+      workspaceRoot,
+      normalized,
+      threadId,
+    });
+    runtime.movePendingReactionToThread(bindingKey, resolvedThreadId);
+
+    if (resolvedThreadId !== threadId && runtime.queuedMessagesByThreadId.has(threadId)) {
+      runtime.queuedMessagesByThreadId.set(
+        resolvedThreadId,
+        runtime.queuedMessagesByThreadId.get(threadId) || []
+      );
+      runtime.queuedMessagesByThreadId.delete(threadId);
+    }
+    return true;
+  } catch (error) {
+    await runtime.clearPendingReactionForBinding(bindingKey);
+    await runtime.sendInfoCardMessage({
+      chatId: normalized.chatId,
+      replyToMessageId: normalized.messageId,
+      text: `插入消息失败: ${error.message}`,
+      kind: "error",
+    });
+    console.error(`[codex-im] dispatch queued message failed thread=${threadId}: ${error.message}`);
+    return false;
+  } finally {
+    runtime.queuedDispatchInFlightByThreadId.delete(threadId);
+  }
+}
+
 module.exports = {
   createWorkspaceThread,
+  dispatchQueuedThreadMessage,
   describeWorkspaceStatus,
+  enqueueThreadMessage,
   ensureThreadAndSendMessage,
   ensureThreadResumed,
+  hasQueuedThreadMessages,
   handleNewCommand,
   handleSwitchCommand,
+  isThreadBusy,
+  requestQueuedTurnInterrupt,
   refreshWorkspaceThreads,
   resolveWorkspaceThreadState,
   switchThreadById,

@@ -150,10 +150,15 @@ function cleanupThreadRuntimeState(runtime, threadId) {
   }
 
   runtime.pendingApprovalByThreadId.delete(threadId);
+  runtime.activeItemByThreadId?.delete(threadId);
   runtime.activeTurnIdByThreadId.delete(threadId);
   runtime.pendingChatContextByThreadId.delete(threadId);
   runtime.bindingKeyByThreadId.delete(threadId);
   runtime.workspaceRootByThreadId.delete(threadId);
+  runtime.currentRunKeyByThreadId.delete(threadId);
+  runtime.currentReplyCardKeyByThreadId?.delete(threadId);
+  runtime.interruptRequestedByThreadId?.delete(threadId);
+  runtime.queuedDispatchInFlightByThreadId?.delete(threadId);
 
   for (const [runKey, entry] of runtime.replyCardByRunKey.entries()) {
     if (entry?.threadId === threadId) {
@@ -163,8 +168,10 @@ function cleanupThreadRuntimeState(runtime, threadId) {
 }
 
 function pruneRuntimeMapSizes(runtime) {
+  pruneMapToLimit(runtime.activeItemByThreadId, MAX_THREAD_CONTEXT_CACHE_ENTRIES);
   pruneMapToLimit(runtime.activeTurnIdByThreadId, MAX_THREAD_CONTEXT_CACHE_ENTRIES);
   pruneMapToLimit(runtime.currentRunKeyByThreadId, MAX_THREAD_CONTEXT_CACHE_ENTRIES);
+  pruneMapToLimit(runtime.currentReplyCardKeyByThreadId, MAX_THREAD_CONTEXT_CACHE_ENTRIES);
 }
 
 function pruneMapToLimit(map, limit) {

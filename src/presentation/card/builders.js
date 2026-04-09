@@ -104,6 +104,11 @@ function buildApprovalCard(approval) {
 
 function buildAssistantReplyCard({ text, state }) {
   const normalizedState = state || "streaming";
+  const statusLine = normalizedState === "failed"
+    ? "**状态：🔴 执行失败**"
+    : normalizedState === "completed"
+      ? "**状态：🟢 已完成**"
+      : "**状态：🟡 进行中**";
   const content = typeof text === "string" && text.trim()
     ? text.trim()
     : normalizedState === "failed"
@@ -122,7 +127,7 @@ function buildAssistantReplyCard({ text, state }) {
       elements: [
         {
           tag: "markdown",
-          content: sanitizeAssistantMarkdown(content),
+          content: `${statusLine}\n\n${sanitizeAssistantMarkdown(content)}`,
           text_size: "normal",
         },
       ],

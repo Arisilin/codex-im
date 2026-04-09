@@ -17,7 +17,7 @@ async function handleStopCommand(runtime, normalized) {
   }
 
   try {
-    await runtime.codex.sendRequest("turn/cancel", {
+    await runtime.codex.sendRequest("turn/interrupt", {
       threadId,
       turnId,
     });
@@ -41,14 +41,44 @@ function handleCodexMessage(runtime, message) {
   }
   codexMessageUtils.trackRunningTurn(runtime.activeTurnIdByThreadId, message);
   codexMessageUtils.trackPendingApproval(runtime.pendingApprovalByThreadId, message);
+  codexMessageUtils.trackActiveItemState(runtime.activeItemByThreadId, message);
   codexMessageUtils.trackRunKeyState(runtime.currentRunKeyByThreadId, runtime.activeTurnIdByThreadId, message);
   runtime.pruneRuntimeMapSizes();
+  const lifecycle = codexMessageUtils.extractItemLifecycle(message);
   const outbound = codexMessageUtils.mapCodexMessageToImEvent(message);
+  const shouldCleanupThreadState = isTerminalTurnMessage(message);
+  const threadId = outbound?.payload?.threadId || lifecycle?.threadId || "";
+
+  const finalizeEventHandling = async () => {
+    if (!threadId) {
+      return;
+    }
+
+    if (lifecycle?.phase === "completed" && runtime.hasQueuedThreadMessages(threadId)) {
+      await runtime.requestQueuedTurnInterrupt(threadId);
+    }
+
+    if (!shouldCleanupThreadState) {
+      return;
+    }
+
+    await runtime.clearPendingReactionForThread(threadId).catch((error) => {
+      console.error(`[codex-im] failed to clear pending reaction: ${error.message}`);
+    });
+    const shouldDispatchQueued = runtime.hasQueuedThreadMessages(threadId);
+    runtime.cleanupThreadRuntimeState(threadId);
+    if (shouldDispatchQueued) {
+      await runtime.dispatchQueuedThreadMessage(threadId);
+    }
+  };
+
   if (!outbound) {
+    finalizeEventHandling().catch((error) => {
+      console.error(`[codex-im] failed to finalize event handling: ${error.message}`);
+    });
     return;
   }
 
-  const threadId = outbound.payload?.threadId || "";
   if (!outbound.payload.turnId) {
     outbound.payload.turnId = runtime.activeTurnIdByThreadId.get(threadId) || "";
   }
@@ -64,19 +94,14 @@ function handleCodexMessage(runtime, message) {
     });
   }
 
-  const shouldCleanupThreadState = isTerminalTurnMessage(message);
   runtime.deliverToFeishu(outbound)
     .catch((error) => {
       console.error(`[codex-im] failed to deliver Feishu message: ${error.message}`);
     })
     .finally(() => {
-      if (!shouldCleanupThreadState || !threadId) {
-        return;
-      }
-      runtime.clearPendingReactionForThread(threadId).catch((error) => {
-        console.error(`[codex-im] failed to clear pending reaction: ${error.message}`);
+      finalizeEventHandling().catch((error) => {
+        console.error(`[codex-im] failed to finalize event handling: ${error.message}`);
       });
-      runtime.cleanupThreadRuntimeState(threadId);
     });
 }
 
@@ -85,8 +110,10 @@ async function deliverToFeishu(runtime, event) {
     await runtime.upsertAssistantReplyCard({
       threadId: event.payload.threadId,
       turnId: event.payload.turnId,
+      itemId: event.payload.itemId,
       chatId: event.payload.chatId,
       text: event.payload.text,
+      textMode: event.payload.textMode,
       state: "streaming",
       deferFlush: !runtime.config.feishuStreamingOutput,
     });

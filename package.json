@@ -1,15 +1,15 @@
 {
-  "name": "@vdug/codex-im",
-  "version": "0.2.2",
+  "name": "@arisilin/codex-im",
+  "version": "0.2.3",
   "description": "Feishu-first local bridge for Codex.",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Ben-Lee-2019/codex-im.git"
+    "url": "git+https://github.com/Arisilin/codex-im.git"
   },
-  "homepage": "https://github.com/Ben-Lee-2019/codex-im#readme",
+  "homepage": "https://github.com/Arisilin/codex-im#readme",
   "bugs": {
-    "url": "https://github.com/Ben-Lee-2019/codex-im/issues"
+    "url": "https://github.com/Arisilin/codex-im/issues"
   },
   "type": "commonjs",
   "main": "src/index.js",
