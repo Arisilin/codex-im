@@ -25,6 +25,7 @@ class SessionStore {
           ...parsed,
           bindings: parsed.bindings || {},
           approvalCommandAllowlistByWorkspaceRoot: parsed.approvalCommandAllowlistByWorkspaceRoot || {},
+          approvalModeByWorkspaceRoot: parsed.approvalModeByWorkspaceRoot || {},
           availableModelCatalog: parsed.availableModelCatalog || {
             models: [],
             updatedAt: "",
@@ -157,6 +158,30 @@ class SessionStore {
     return normalizeCommandAllowlist(allowlist);
   }
 
+  getApprovalModeForWorkspace(workspaceRoot) {
+    const normalizedWorkspaceRoot = normalizeValue(workspaceRoot);
+    if (!normalizedWorkspaceRoot) {
+      return "manual";
+    }
+    const rawMode = this.state.approvalModeByWorkspaceRoot?.[normalizedWorkspaceRoot];
+    return normalizeApprovalMode(rawMode);
+  }
+
+  setApprovalModeForWorkspace(workspaceRoot, mode) {
+    const normalizedWorkspaceRoot = normalizeValue(workspaceRoot);
+    if (!normalizedWorkspaceRoot) {
+      return "manual";
+    }
+
+    const normalizedMode = normalizeApprovalMode(mode);
+    this.state.approvalModeByWorkspaceRoot = {
+      ...(this.state.approvalModeByWorkspaceRoot || {}),
+      [normalizedWorkspaceRoot]: normalizedMode,
+    };
+    this.save();
+    return normalizedMode;
+  }
+
   getAvailableModelCatalog() {
     const raw = this.state.availableModelCatalog;
     if (!raw || typeof raw !== "object") {
@@ -274,6 +299,7 @@ function createEmptyState() {
   return {
     bindings: {},
     approvalCommandAllowlistByWorkspaceRoot: {},
+    approvalModeByWorkspaceRoot: {},
     availableModelCatalog: {
       models: [],
       updatedAt: "",
@@ -305,6 +331,10 @@ function normalizeCommandAllowlist(allowlist) {
   return allowlist
     .map((tokens) => normalizeCommandTokens(tokens))
     .filter((tokens) => tokens.length > 0);
+}
+
+function normalizeApprovalMode(value) {
+  return value === "all" ? "all" : "manual";
 }
 
 module.exports = { SessionStore };

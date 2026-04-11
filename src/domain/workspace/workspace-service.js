@@ -134,6 +134,7 @@ async function showStatusPanel(runtime, normalized, { replyToMessageId, noticeTe
   const availableModels = Array.isArray(availableCatalog?.models) ? availableCatalog.models : [];
   const modelOptions = buildModelSelectOptions(availableModels);
   const effortOptions = buildEffortSelectOptions(availableModels, codexParams?.model || "");
+  const approvalPolicyText = describeApprovalPolicy(runtime, workspaceRoot);
   await runtime.sendInteractiveCard({
     chatId: normalized.chatId,
     replyToMessageId: replyTarget,
@@ -147,6 +148,7 @@ async function showStatusPanel(runtime, normalized, { replyToMessageId, noticeTe
       recentThreads,
       totalThreadCount: threads.length,
       status,
+      approvalPolicyText,
       noticeText,
     }),
   });
@@ -607,6 +609,19 @@ module.exports = {
   switchWorkspaceByPath,
   validateDefaultCodexParamsConfig,
 };
+
+function describeApprovalPolicy(runtime, workspaceRoot) {
+  const approvalMode = runtime.getApprovalModeForWorkspace(workspaceRoot);
+  if (approvalMode === "all") {
+    return "全量自动批准";
+  }
+
+  const allowlist = runtime.sessionStore.getApprovalCommandAllowlistForWorkspace(workspaceRoot);
+  if (allowlist.length > 0) {
+    return `按命令前缀自动允许（${allowlist.length}）`;
+  }
+  return "手动审批";
+}
 
 function resolveWorkspaceSendTarget(workspaceRoot, requestedPath) {
   const normalizedInput = normalizeWorkspacePath(requestedPath);

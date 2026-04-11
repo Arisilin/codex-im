@@ -358,9 +358,15 @@ async function flushReplyCard(runtime, runKey) {
     return;
   }
 
+  const workspaceRoot = runtime.resolveWorkspaceRootForThread(entry.threadId);
+  const autoApproveEnabled = workspaceRoot
+    ? runtime.getApprovalModeForWorkspace(workspaceRoot) === "all"
+    : false;
+
   const card = buildAssistantReplyCard({
     text: buildReplyCardText(entry),
     state: entry.state,
+    autoApproveEnabled,
   });
 
   if (!entry.messageId) {

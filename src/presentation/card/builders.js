@@ -102,13 +102,15 @@ function buildApprovalCard(approval) {
   };
 }
 
-function buildAssistantReplyCard({ text, state }) {
+function buildAssistantReplyCard({ text, state, autoApproveEnabled = false }) {
   const normalizedState = state || "streaming";
-  const statusLine = normalizedState === "failed"
-    ? "**状态：🔴 执行失败**"
+  const statusLabel = normalizedState === "failed"
+    ? "🔴 执行失败"
     : normalizedState === "completed"
-      ? "**状态：🟢 已完成**"
-      : "**状态：🟡 进行中**";
+      ? "🟢 已完成"
+      : "🟡 进行中";
+  const approvalLabel = autoApproveEnabled ? "自动审批：开启" : "自动审批：关闭";
+  const statusLine = `**状态：${statusLabel}｜${approvalLabel}**`;
   const content = typeof text === "string" && text.trim()
     ? text.trim()
     : normalizedState === "failed"
@@ -244,6 +246,7 @@ function buildStatusPanelCard({
   recentThreads,
   totalThreadCount,
   status,
+  approvalPolicyText = "",
   noticeText = "",
 }) {
   const isRunning = status?.code === "running";
@@ -293,6 +296,13 @@ function buildStatusPanelCard({
                 `**当前项目**：\`${escapeCardMarkdown(workspaceRoot)}\``,
               ].join(""),
             },
+            ...(approvalPolicyText
+              ? [{
+                tag: "markdown",
+                content: `**授权策略**：${escapeCardMarkdown(approvalPolicyText)}`,
+                text_size: "notation",
+              }]
+              : []),
           ],
         },
       ],
@@ -502,7 +512,7 @@ function buildHelpCardText() {
     ],
     [
       "**审批命令**",
-      "`/codex approve`\n`/codex approve workspace`\n`/codex reject`",
+      "`/codex approve`\n`/codex approve workspace`\n`/codex approve all`\n`/codex approve off`\n`/codex reject`",
       "用于处理 Codex 发起的审批请求。",
     ],
   ];

@@ -126,7 +126,7 @@ function parseCommand(text) {
     new: ["new"],
     model: ["model"],
     effort: ["effort"],
-    approve: ["approve", "approve workspace"],
+    approve: ["approve", "approve workspace", "approve all", "approve off"],
     reject: ["reject"],
   };
 
@@ -153,6 +153,9 @@ function parseCommand(text) {
   }
   if (matchesPrefixCommand(normalized, "effort")) {
     return "effort";
+  }
+  if (matchesPrefixCommand(normalized, "approve")) {
+    return "approve";
   }
   if (prefixes.some((prefix) => normalized.startsWith(prefix))) {
     return "unknown_command";

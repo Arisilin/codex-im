@@ -91,7 +91,73 @@ function buildApprovalResultText({ decision, scope, method }) {
   return "已允许本次请求。";
 }
 
+function isApproveAllCommand(text) {
+  return normalizeCommandText(text) === "/codex approve all";
+}
+
+function isApproveOffCommand(text) {
+  return normalizeCommandText(text) === "/codex approve off";
+}
+
+function normalizeCommandText(text) {
+  return typeof text === "string" ? text.trim().toLowerCase() : "";
+}
+
+async function handleApprovalModeCommand(runtime, normalized, mode) {
+  const workspaceContext = await resolveApprovalWorkspaceContext(runtime, normalized);
+  if (!workspaceContext) {
+    return true;
+  }
+
+  const { workspaceRoot, threadId } = workspaceContext;
+  const resolvedMode = runtime.setApprovalModeForWorkspace(workspaceRoot, mode);
+  const enabled = resolvedMode === "all";
+  if (enabled && threadId) {
+    const approval = runtime.pendingApprovalByThreadId.get(threadId) || null;
+    if (approval) {
+      const outcome = await runtime.applyApprovalDecision({
+        threadId,
+        approval,
+        command: "approve",
+        workspaceRoot,
+        scope: "once",
+      });
+      if (outcome.error) {
+        throw outcome.error;
+      }
+    }
+  }
+  await runtime.showStatusPanel(normalized, {
+    replyToMessageId: normalized.messageId,
+    noticeText: enabled
+      ? "已为当前项目开启全量自动批准"
+      : "已关闭当前项目的全量自动批准",
+  });
+  return true;
+}
+
+async function resolveApprovalWorkspaceContext(runtime, normalized) {
+  const current = runtime.getCurrentThreadContext(normalized);
+  if (current?.workspaceRoot) {
+    return current;
+  }
+
+  await runtime.sendInfoCardMessage({
+    chatId: normalized.chatId,
+    replyToMessageId: normalized.messageId,
+    text: "当前会话还未绑定项目。先发送 `/codex bind /绝对路径`。",
+  });
+  return null;
+}
+
 async function handleApprovalCommand(runtime, normalized) {
+  if (isApproveAllCommand(normalized.text)) {
+    return handleApprovalModeCommand(runtime, normalized, "all");
+  }
+  if (isApproveOffCommand(normalized.text)) {
+    return handleApprovalModeCommand(runtime, normalized, "manual");
+  }
+
   const { workspaceRoot, threadId } = runtime.getCurrentThreadContext(normalized);
   const approval = threadId ? runtime.pendingApprovalByThreadId.get(threadId) || null : null;
 

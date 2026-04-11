@@ -82,6 +82,7 @@ class FeishuBotRuntime {
     this.bindingKeyByThreadId = new Map();
     this.workspaceRootByThreadId = new Map();
     this.approvalAllowlistByWorkspaceRoot = new Map();
+    this.approvalModeByWorkspaceRoot = new Map();
     this.inFlightApprovalRequestKeys = new Set();
     this.resumedThreadIds = new Set();
     this.codex.onMessage((message) => appDispatcher.onCodexMessage(this, message));
@@ -265,7 +266,9 @@ function attachRuntimeForwarders() {
     setReplyCardEntry: runtimeState.setReplyCardEntry,
     setCurrentRunKeyForThread: runtimeState.setCurrentRunKeyForThread,
     resolveWorkspaceRootForThread: runtimeState.resolveWorkspaceRootForThread,
+    getApprovalModeForWorkspace: approvalPolicyRuntime.getApprovalModeForWorkspace,
     rememberApprovalPrefixForWorkspace: approvalPolicyRuntime.rememberApprovalPrefixForWorkspace,
+    setApprovalModeForWorkspace: approvalPolicyRuntime.setApprovalModeForWorkspace,
     shouldAutoApproveRequest: approvalPolicyRuntime.shouldAutoApproveRequest,
     tryAutoApproveRequest: approvalPolicyRuntime.tryAutoApproveRequest,
     applyApprovalDecision: approvalRuntime.applyApprovalDecision,

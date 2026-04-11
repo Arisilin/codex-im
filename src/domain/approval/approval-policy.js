@@ -13,9 +13,34 @@ function rememberApprovalPrefixForWorkspace(runtime, workspaceRoot, commandToken
   );
 }
 
+function setApprovalModeForWorkspace(runtime, workspaceRoot, mode) {
+  if (!workspaceRoot) {
+    return "manual";
+  }
+  const resolvedMode = runtime.sessionStore.setApprovalModeForWorkspace(workspaceRoot, mode);
+  runtime.approvalModeByWorkspaceRoot.set(workspaceRoot, resolvedMode);
+  return resolvedMode;
+}
+
+function getApprovalModeForWorkspace(runtime, workspaceRoot) {
+  if (!workspaceRoot) {
+    return "manual";
+  }
+  const cachedMode = runtime.approvalModeByWorkspaceRoot.get(workspaceRoot);
+  if (cachedMode) {
+    return cachedMode;
+  }
+  const mode = runtime.sessionStore.getApprovalModeForWorkspace(workspaceRoot);
+  runtime.approvalModeByWorkspaceRoot.set(workspaceRoot, mode);
+  return mode;
+}
+
 function shouldAutoApproveRequest(runtime, workspaceRoot, approval) {
   if (!workspaceRoot || !approval) {
     return false;
+  }
+  if (getApprovalModeForWorkspace(runtime, workspaceRoot) === "all") {
+    return true;
   }
   const cachedAllowlist = runtime.approvalAllowlistByWorkspaceRoot.get(workspaceRoot) || [];
   const allowlist = cachedAllowlist.length
@@ -51,7 +76,9 @@ async function tryAutoApproveRequest(runtime, threadId, approval) {
 }
 
 module.exports = {
+  getApprovalModeForWorkspace,
   rememberApprovalPrefixForWorkspace,
+  setApprovalModeForWorkspace,
   shouldAutoApproveRequest,
   tryAutoApproveRequest,
 };
